@@ -84,7 +84,7 @@ $$
     - **推理语料 (80%)**: OpenR1-Math, GSM8K, MATH。*关键逻辑：必须包含 `<think>` 过程，以捕捉 "Society of Thought" 特征。*
     - **通用语料 (20%)**: FineWeb-Edu。*关键逻辑：用于锚定基础语言语义，防止特征空间坍塌。*
 - **实现步骤**:
-    1. **数据清洗 (Parser)**: 编写过滤器，仅保留 `<think>...</think>` 内部的 Token 以及最终答案的推导部分。丢弃纯 Question 部分。
+    1. **数据清洗与切割 (Parser & Splitter)**: 完整保留 Query 作为上下文输入以维持模型状态。在提取激活值时，**以 `\n\n` 为界限对推理过程 (CoT) 进行逻辑分段**，仅针对分段内的 Token 提取并保存激活向量，从而在保留完整语义背景的同时实现细粒度的特征对齐。
     2. **Hook 注入**: 在目标层注册 forward hook，提取 `residual_stream`。
     3. **Buffer 与分片**:
         - 运行模型 (Inference Mode, BF16)，Batch Size 设为显存允许的最大值。

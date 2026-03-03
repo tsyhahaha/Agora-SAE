@@ -113,7 +113,7 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        choices=["deepseek-1.5b", "qwen3-8b", "qwq-32b"],
+        choices=["deepseek-1.5b", "qwen3-8b", "qwq-32b", "math500-1.5b"],
         default=None,
         help="Use a preset configuration"
     )

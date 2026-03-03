@@ -31,18 +31,15 @@
 
 * **Class**: `MixedTokenSource`
 * **Inputs**:
-* `reasoning_datasets`: List[str] (e.g., "OpenR1-Math", "GSM8K")
+* `reasoning_datasets`: List[str] (e.g., "MATH500", "OpenR1-Math")
 * `general_datasets`: List[str] (e.g., "FineWeb-Edu")
 * `ratio`: float = 0.8
 
 
 * **Logic**:
 * 实现 `IterableDataset`。
-* **Reasoning Parser**: 针对 Reasoning 数据，编写正则提取器。
-* **Strict Filter**: 仅保留 `<think>` ... `</think>` 内部文本以及 `Solution` 部分。
-* **Drop**: 丢弃纯 Question 部分（或以 0.1 概率采样）。
-
-
+* **Reasoning Parser**: 针对 Reasoning 数据，编写提取器。
+* **Strict Filter & Split**: 必须保留完整的 `Query`、`<think>` 内部文本以及 `Solution` 作为推理上下文输入模型。在**提取目标激活值**时，则针对于 `<think>` 和 `Solution` 部分的推导链，**强制以 `\n\n` 为界限对推理过程进行逻辑分段**，仅针对分段内的 Token 提取并保存激活向量 (sentence-level extraction)。通过这种方式，在保留模型完整语义背景的同时，实现细粒度的特征对齐与字典学习。
 * **Tokenization**: 使用 `AutoTokenizer` (Qwen/DeepSeek)。
 * **Output**: Stream of `input_ids` (tensor).
 

@@ -271,13 +271,17 @@ class OfflineActivationGenerator:
                 
                 # Get captured activations and add to buffer
                 if self._captured_activations is not None:
-                    # Apply attention mask to filter padding
-                    if attention_mask is not None:
-                        # Flatten and filter
-                        activations = self._captured_activations  # [B, S, D]
+                    # Apply attention mask or extraction mask to filter padding / specific sentences
+                    extraction_mask = batch.get("extraction_mask", None)
+                    if extraction_mask is not None:
+                        extraction_mask = extraction_mask.to(self.device).bool()
+                        valid_activations = self._captured_activations[extraction_mask]
+                        self.buffer.add(valid_activations)
+                        total_tokens += valid_activations.shape[0]
+                    elif attention_mask is not None:
+                        # Fallback to filtering out padding only
                         mask = attention_mask.bool()  # [B, S]
-                        # Extract non-padding activations
-                        valid_activations = activations[mask]  # [N, D]
+                        valid_activations = self._captured_activations[mask]  # [N, D]
                         self.buffer.add(valid_activations)
                         total_tokens += valid_activations.shape[0]
                     else:

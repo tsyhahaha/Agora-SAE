@@ -28,6 +28,10 @@ class DataConfig:
     reasoning_ratio: float = 0.8  # 80% reasoning, 20% general
     max_seq_length: int = 2048
     question_sample_prob: float = 0.1  # Probability to keep pure question parts
+    
+    # New configurations for sentence-level extraction
+    extraction_split_token: Optional[str] = None  # e.g., "\n\n"
+    retain_query: bool = False  # Keep full prompt context?
 
 
 @dataclass
@@ -115,6 +119,21 @@ PRESETS = {
             d_model=5120
         ),
         sae=SAEConfig(expansion_factor=32, k=64)
+    ),
+    "math500-1.5b": Config(
+        model=ModelConfig(
+            model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
+            hook_layer=12,
+            d_model=1536
+        ),
+        data=DataConfig(
+            reasoning_datasets=["MATH500"],  # Will be mapped specifically
+            general_datasets=[],  # 100% reasoning for this math test
+            reasoning_ratio=1.0,
+            extraction_split_token="\n\n",
+            retain_query=True
+        ),
+        sae=SAEConfig(expansion_factor=32, k=32)
     )
 }
 
