@@ -53,14 +53,14 @@ def main():
         "--general-datasets",
         type=str,
         nargs="+",
-        default=["HuggingFaceFW/fineweb-edu"],
+        default=None,  # ["HuggingFaceFW/fineweb-edu"],
         help="General dataset names"
     )
     parser.add_argument(
         "--reasoning-ratio",
         type=float,
-        default=0.8,
-        help="Ratio of reasoning data (default: 0.8)"
+        default=1,
+        help="Ratio of reasoning data (default: 1)"
     )
     
     # Storage arguments

@@ -13,7 +13,7 @@ from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer
 from safetensors.torch import save_file, load_file
 from tqdm import tqdm
 
@@ -181,7 +181,7 @@ class OfflineActivationGenerator:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
             
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = AutoModel.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
             device_map="auto",
