@@ -13,136 +13,153 @@ from pathlib import Path
 
 from transformers import AutoTokenizer
 
-from agora_sae.config import Config, ModelConfig, DataConfig, StorageConfig, get_config
-from agora_sae.data.mixed_source import create_dataloader
 from agora_sae.activation.generator import OfflineActivationGenerator
+from agora_sae.config import Config, get_config
+from agora_sae.data.mixed_source import create_dataloader
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """Build the CLI parser."""
     parser = argparse.ArgumentParser(description="Generate activations for SAE training")
-    
+
     # Model arguments
     parser.add_argument(
-        "--model", 
-        type=str, 
-        default="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
-        help="HuggingFace model name"
+        "--model",
+        type=str,
+        default=None,
+        help="HuggingFace model name or local model path",
     )
     parser.add_argument(
-        "--layer", 
-        type=int, 
-        default=12,
-        help="Layer to extract activations from"
+        "--layer",
+        type=int,
+        default=None,
+        help="Layer to extract activations from",
     )
     parser.add_argument(
         "--d-model",
         type=int,
-        default=1536,
-        help="Model hidden dimension"
+        default=None,
+        help="Model hidden dimension",
     )
-    
+
     # Data arguments
     parser.add_argument(
         "--reasoning-datasets",
         type=str,
         nargs="+",
-        default=["open-r1/OpenR1-Math-220k"],
-        help="Reasoning dataset names"
+        default=None,
+        help="Reasoning dataset names or local dataset paths",
     )
     parser.add_argument(
         "--general-datasets",
         type=str,
         nargs="+",
-        default=None,  # ["HuggingFaceFW/fineweb-edu"],
-        help="General dataset names"
+        default=None,
+        help="General dataset names or local dataset paths",
     )
     parser.add_argument(
         "--reasoning-ratio",
         type=float,
-        default=1,
-        help="Ratio of reasoning data (default: 1)"
+        default=None,
+        help="Ratio of reasoning data",
     )
-    
+
     # Storage arguments
     parser.add_argument(
         "--output",
         type=str,
-        default="./buffer_shards",
-        help="Output directory for shard files"
+        default=None,
+        help="Output directory for shard files",
     )
     parser.add_argument(
         "--buffer-size-mb",
         type=int,
-        default=500,
-        help="Size of in-memory shuffle buffer in MB"
+        default=None,
+        help="Size of in-memory shuffle buffer in MB",
     )
     parser.add_argument(
         "--shard-size-mb",
         type=int,
-        default=100,
-        help="Size of each shard file in MB"
+        default=None,
+        help="Size of each shard file in MB",
     )
     parser.add_argument(
         "--max-disk-gb",
         type=int,
-        default=200,
-        help="Maximum disk usage in GB before pausing"
+        default=None,
+        help="Maximum disk usage in GB before pausing",
     )
-    
+
     # Generation arguments
     parser.add_argument(
         "--batch-size",
         type=int,
         default=64,
-        help="Batch size for inference"
+        help="Batch size for inference",
     )
     parser.add_argument(
         "--max-batches",
         type=int,
         default=None,
-        help="Maximum number of batches (None for unlimited)"
+        help="Maximum number of batches (None for unlimited)",
     )
     parser.add_argument(
         "--max-seq-length",
         type=int,
-        default=2048,
-        help="Maximum sequence length"
+        default=None,
+        help="Maximum sequence length",
     )
-    
+
     # Preset argument
     parser.add_argument(
         "--preset",
         type=str,
         choices=["deepseek-1.5b", "qwen3-8b", "qwq-32b", "math500-1.5b"],
         default=None,
-        help="Use a preset configuration"
+        help="Use a preset configuration",
     )
-    
+
+    return parser
+
+
+def build_config_from_args(args: argparse.Namespace) -> Config:
+    """Build a config from CLI args while allowing presets to be overridden."""
+    config = get_config(args.preset) if args.preset else Config()
+
+    if args.model is not None:
+        config.model.model_name = args.model
+    if args.layer is not None:
+        config.model.hook_layer = args.layer
+    if args.d_model is not None:
+        config.model.d_model = args.d_model
+
+    if args.reasoning_datasets is not None:
+        config.data.reasoning_datasets = args.reasoning_datasets
+    if args.general_datasets is not None:
+        config.data.general_datasets = args.general_datasets
+    if args.reasoning_ratio is not None:
+        config.data.reasoning_ratio = args.reasoning_ratio
+    if args.max_seq_length is not None:
+        config.data.max_seq_length = args.max_seq_length
+
+    if args.output is not None:
+        config.storage.storage_path = Path(args.output)
+    if args.buffer_size_mb is not None:
+        config.storage.buffer_size_mb = args.buffer_size_mb
+    if args.shard_size_mb is not None:
+        config.storage.shard_size_mb = args.shard_size_mb
+    if args.max_disk_gb is not None:
+        config.storage.max_disk_usage_gb = args.max_disk_gb
+
+    config.storage.storage_path = Path(config.storage.storage_path)
+    config.storage.storage_path.mkdir(parents=True, exist_ok=True)
+    return config
+
+
+def main():
+    parser = build_parser()
     args = parser.parse_args()
-    
-    # Build configuration
-    if args.preset:
-        config = get_config(args.preset)
-    else:
-        config = Config(
-            model=ModelConfig(
-                model_name=args.model,
-                hook_layer=args.layer,
-                d_model=args.d_model
-            ),
-            data=DataConfig(
-                reasoning_datasets=args.reasoning_datasets,
-                general_datasets=args.general_datasets,
-                reasoning_ratio=args.reasoning_ratio,
-                max_seq_length=args.max_seq_length
-            ),
-            storage=StorageConfig(
-                storage_path=Path(args.output),
-                buffer_size_mb=args.buffer_size_mb,
-                shard_size_mb=args.shard_size_mb,
-                max_disk_usage_gb=args.max_disk_gb
-            )
-        )
+    config = build_config_from_args(args)
     
     print("="*60)
     print("ACTIVATION GENERATION CONFIGURATION")

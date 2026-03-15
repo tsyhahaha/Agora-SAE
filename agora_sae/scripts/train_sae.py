@@ -133,7 +133,7 @@ def main():
     parser.add_argument(
         "--preset",
         type=str,
-        choices=["deepseek-1.5b", "qwen3-8b", "qwq-32b"],
+        choices=["deepseek-1.5b", "qwen3-8b", "qwq-32b", "math500-1.5b"],
         default=None,
         help="Use a preset configuration"
     )
@@ -143,11 +143,15 @@ def main():
     # Build configuration
     if args.preset:
         config = get_config(args.preset)
-        # Override with CLI args
+
+        config.storage.storage_path = Path(args.shards)
+        config.storage.delete_after_read = args.delete_after_read
         config.training.batch_size = args.batch_size
         config.training.lr = args.lr
         config.training.total_steps = args.steps
         config.training.warmup_steps = args.warmup_steps
+        config.wandb_project = args.wandb_project
+        config.wandb_run_name = args.wandb_run
     else:
         config = Config(
             model=ModelConfig(d_model=args.d_model),
@@ -169,6 +173,9 @@ def main():
             wandb_project=args.wandb_project,
             wandb_run_name=args.wandb_run
         )
+
+    config.storage.storage_path = Path(config.storage.storage_path)
+    config.storage.storage_path.mkdir(parents=True, exist_ok=True)
     
     print("="*60)
     print("SAE TRAINING CONFIGURATION")

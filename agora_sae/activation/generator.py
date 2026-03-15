@@ -4,18 +4,16 @@ Module B: Activation Generator (Stage 1)
 Offline activation generation with global shuffle buffer and safetensors storage.
 """
 
-import os
-import random
-import shutil
+import time
 from pathlib import Path
-from typing import List, Optional, Callable
+from typing import Callable, List, Optional
 from datetime import datetime
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoModel, AutoTokenizer
-from safetensors.torch import save_file, load_file
+from safetensors.torch import save_file
 from tqdm import tqdm
+from transformers import AutoModel
 
 
 class ActivationBuffer:
@@ -30,7 +28,8 @@ class ActivationBuffer:
         buffer_size_mb: int = 500,
         d_model: int = 1536,
         storage_path: Path = Path("./buffer_shards"),
-        shard_size_mb: int = 100
+        shard_size_mb: int = 100,
+        storage_dtype: torch.dtype = torch.bfloat16,
     ):
         """
         Initialize the activation buffer.
@@ -44,16 +43,16 @@ class ActivationBuffer:
         self.d_model = d_model
         self.storage_path = Path(storage_path)
         self.storage_path.mkdir(parents=True, exist_ok=True)
-        
-        # Calculate number of activations that fit in buffer
-        # Each activation: d_model floats * 4 bytes (float32) = d_model * 4 bytes
-        bytes_per_activation = d_model * 4
+
+        self.storage_dtype = storage_dtype
+        bytes_per_activation = d_model * torch.tensor([], dtype=storage_dtype).element_size()
         self.buffer_capacity = (buffer_size_mb * 1024 * 1024) // bytes_per_activation
         self.shard_capacity = (shard_size_mb * 1024 * 1024) // bytes_per_activation
-        
+
         self.buffer: List[torch.Tensor] = []
+        self.buffer_rows = 0
         self.shard_counter = 0
-        
+
     def add(self, activations: torch.Tensor):
         """
         Add activations to buffer.
@@ -64,52 +63,43 @@ class ActivationBuffer:
         # Flatten to [N, d_model] if needed
         if activations.dim() == 3:
             activations = activations.reshape(-1, self.d_model)
-            
-        # Convert to float32 and move to CPU
-        activations = activations.float().cpu()
-        
+
+        activations = activations.to(dtype=self.storage_dtype, device="cpu")
         self.buffer.append(activations)
-        
-        # Check if buffer is full
-        total_size = sum(a.shape[0] for a in self.buffer)
-        if total_size >= self.buffer_capacity:
+        self.buffer_rows += activations.shape[0]
+
+        if self.buffer_rows >= self.buffer_capacity:
             self._flush()
-            
+
     def _flush(self):
         """Shuffle buffer and write to disk."""
         if not self.buffer:
             return
-            
-        # Concatenate all activations
+
         all_activations = torch.cat(self.buffer, dim=0)
-        
-        # Global shuffle
         perm = torch.randperm(all_activations.shape[0])
         all_activations = all_activations[perm]
-        
-        # Write shards
+
         n_shards = (all_activations.shape[0] + self.shard_capacity - 1) // self.shard_capacity
-        
+
         for i in range(n_shards):
             start_idx = i * self.shard_capacity
             end_idx = min((i + 1) * self.shard_capacity, all_activations.shape[0])
             shard_data = all_activations[start_idx:end_idx]
-            
-            # Generate shard filename with timestamp
+
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             shard_path = self.storage_path / f"shard_{timestamp}_{self.shard_counter:06d}.safetensors"
-            
             save_file({"activations": shard_data}, str(shard_path))
             self.shard_counter += 1
-            
-        # Clear buffer
+
         self.buffer = []
-        
+        self.buffer_rows = 0
+
     def finalize(self):
         """Flush any remaining data in buffer."""
         if self.buffer:
             self._flush()
-            
+
     def get_disk_usage_gb(self) -> float:
         """Get current disk usage in GB."""
         total_size = 0
@@ -155,32 +145,25 @@ class OfflineActivationGenerator:
         self.d_model = d_model
         self.max_disk_usage_gb = max_disk_usage_gb
         self.device = device
-        
+
         # Initialize buffer
         self.buffer = ActivationBuffer(
             buffer_size_mb=buffer_size_mb,
             d_model=d_model,
             storage_path=storage_path,
-            shard_size_mb=shard_size_mb
+            shard_size_mb=shard_size_mb,
         )
-        
+
         # Will be set during model loading
         self.model = None
-        self.tokenizer = None
+        self.input_device = None
         self._hook_handle = None
         self._captured_activations = None
-        
+
     def load_model(self):
         """Load the model in BF16 with inference mode."""
         print(f"Loading model: {self.model_name}")
-        
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            self.model_name,
-            trust_remote_code=True
-        )
-        if self.tokenizer.pad_token is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
-            
+
         self.model = AutoModel.from_pretrained(
             self.model_name,
             torch_dtype=torch.bfloat16,
@@ -188,12 +171,19 @@ class OfflineActivationGenerator:
             trust_remote_code=True
         )
         self.model.eval()
-        
-        # Register hook
+        self.input_device = self._get_input_device()
         self._register_hook()
-        
+
         print(f"Model loaded. Hook registered on layer {self.hook_layer}")
-        
+
+    def _get_input_device(self) -> torch.device:
+        """Get the device that should receive model inputs."""
+        if hasattr(self.model, "get_input_embeddings"):
+            input_embeddings = self.model.get_input_embeddings()
+            if input_embeddings is not None:
+                return input_embeddings.weight.device
+        return next(self.model.parameters()).device
+
     def _register_hook(self):
         """Register forward hook on target layer."""
         # Get the target layer
@@ -209,21 +199,21 @@ class OfflineActivationGenerator:
                 raise ValueError(f"Could not find layers in model architecture")
         except IndexError:
             raise ValueError(f"Layer {self.hook_layer} does not exist in model")
-            
-        def hook_fn(module, input, output):
+
+        def hook_fn(module, inputs, output):
             # Capture the residual stream (input to the layer)
-            if isinstance(input, tuple):
-                self._captured_activations = input[0].detach()
+            if isinstance(inputs, tuple):
+                self._captured_activations = inputs[0].detach()
             else:
-                self._captured_activations = input.detach()
-                
+                self._captured_activations = inputs.detach()
+
         self._hook_handle = target_layer.register_forward_hook(hook_fn)
-        
+
     def _check_disk_usage(self) -> bool:
         """Check if disk usage is below threshold."""
         usage = self.buffer.get_disk_usage_gb()
         return usage < self.max_disk_usage_gb
-        
+
     def run_generation_loop(
         self,
         dataloader: DataLoader,
@@ -240,12 +230,12 @@ class OfflineActivationGenerator:
         """
         if self.model is None:
             self.load_model()
-            
+
         batch_count = 0
         total_tokens = 0
-        
+
         pbar = tqdm(dataloader, desc="Generating activations")
-        
+
         with torch.inference_mode():
             for batch in pbar:
                 # Check disk usage
@@ -253,64 +243,57 @@ class OfflineActivationGenerator:
                     print(f"Disk usage exceeded {self.max_disk_usage_gb}GB. Pausing...")
                     # Wait for trainer to consume some shards
                     while not self._check_disk_usage():
-                        import time
-                        time.sleep(60)  # Check every minute
-                        
+                        time.sleep(60)
+
                 # Move batch to device
-                input_ids = batch["input_ids"].to(self.device)
+                input_ids = batch["input_ids"].to(self.input_device)
                 attention_mask = batch.get("attention_mask", None)
                 if attention_mask is not None:
-                    attention_mask = attention_mask.to(self.device)
-                    
-                # Forward pass (hook will capture activations)
+                    attention_mask = attention_mask.to(self.input_device)
+
+                self._captured_activations = None
                 self.model(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    use_cache=False
+                    use_cache=False,
                 )
-                
-                # Get captured activations and add to buffer
+
                 if self._captured_activations is not None:
-                    # First get the actual device where the captured activations are
                     target_device = self._captured_activations.device
-                    
-                    # Apply attention mask or extraction mask to filter padding / specific sentences
                     extraction_mask = batch.get("extraction_mask", None)
                     if extraction_mask is not None:
                         extraction_mask = extraction_mask.to(target_device).bool()
                         valid_activations = self._captured_activations[extraction_mask]
-                        self.buffer.add(valid_activations)
-                        total_tokens += valid_activations.shape[0]
                     elif attention_mask is not None:
-                        # Fallback to filtering out padding only
-                        mask = attention_mask.to(target_device).bool()  # [B, S]
-                        valid_activations = self._captured_activations[mask]  # [N, D]
+                        mask = attention_mask.to(target_device).bool()
+                        valid_activations = self._captured_activations[mask]
+                    else:
+                        valid_activations = self._captured_activations.reshape(-1, self.d_model)
+
+                    if valid_activations.numel() > 0:
                         self.buffer.add(valid_activations)
                         total_tokens += valid_activations.shape[0]
-                    else:
-                        self.buffer.add(self._captured_activations)
-                        total_tokens += self._captured_activations.numel() // self.d_model
-                        
+
                 batch_count += 1
                 pbar.set_postfix({
                     "tokens": f"{total_tokens/1e6:.1f}M",
                     "shards": self.buffer.shard_counter
                 })
-                
+
                 if progress_callback:
                     progress_callback(batch_count, total_tokens)
-                    
+
                 if max_batches and batch_count >= max_batches:
                     break
-                    
-        # Finalize buffer
+
         self.buffer.finalize()
         print(f"Generation complete. Total tokens: {total_tokens/1e6:.1f}M, Shards: {self.buffer.shard_counter}")
-        
+
     def cleanup(self):
         """Clean up resources."""
         if self._hook_handle:
             self._hook_handle.remove()
         self.model = None
-        self.tokenizer = None
-        torch.cuda.empty_cache()
+        self.input_device = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()

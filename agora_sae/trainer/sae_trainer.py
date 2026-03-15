@@ -103,7 +103,11 @@ class SAETrainer:
                     "aux_loss_weight": config.sae.aux_loss_weight
                 }
             )
-            
+
+    def _prepare_batch(self, batch: torch.Tensor) -> torch.Tensor:
+        """Move a batch to the training device and cast it to the SAE dtype."""
+        return batch.to(self.device, dtype=self.sae.W_enc.dtype)
+
     def train_step(self, batch: torch.Tensor) -> Dict[str, float]:
         """
         Execute a single training step.
@@ -114,7 +118,7 @@ class SAETrainer:
         Returns:
             Dictionary of metrics
         """
-        batch = batch.to(self.device)
+        batch = self._prepare_batch(batch)
         
         # Forward pass
         x_hat, f, topk_indices, z = self.sae(batch)
@@ -197,8 +201,9 @@ class SAETrainer:
                 if (dead_ratio > self.config.training.dead_latent_threshold and 
                     isinstance(self.sae, TopKSAEWithResampling)):
                     with torch.no_grad():
-                        x_hat, _, _, _ = self.sae(batch)
-                        n_resampled = self.sae.resample_dead_latents(batch, x_hat)
+                        batch_on_device = self._prepare_batch(batch)
+                        x_hat, _, _, _ = self.sae(batch_on_device)
+                        n_resampled = self.sae.resample_dead_latents(batch_on_device, x_hat)
                         print(f"Step {self.step}: Resampled {n_resampled} dead latents")
                         
             # Logging

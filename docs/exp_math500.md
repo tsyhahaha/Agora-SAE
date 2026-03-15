@@ -12,6 +12,8 @@
   - **Local Path**: `<LOCAL_MODEL_PATH>` (替换为你下载到本地的模型权重路径)
 - **Source Dataset**: `MATH`
   - **Local Path**: `<LOCAL_DATASET_PATH>` (替换为你下载到本地的数据集路径)
+- **Sampled Dataset**: `MATH500`
+  - **Local Path**: `<LOCAL_MATH500_PATH>` (由下文的采样脚本生成)
 
 ### 1.2 数据采样与处理逻辑 (Data Ingestion)
 - **MATH500 抽样**:
@@ -37,31 +39,50 @@
 
 本实验遵循项目中定义的 **Staged Offline** 架构，分为激活生成、SAE 训练和特征分析三个阶段。
 
+### Phase 0: 生成本地 `MATH500` 子集
+
+先从本地全量数学数据集中抽取固定 500 条，保证后续实验可复现。
+
+**执行命令**:
+```bash
+python -m agora_sae.scripts.sample_dataset \
+    --dataset-path <LOCAL_DATASET_PATH> \
+    --output-path <LOCAL_MATH500_PATH> \
+    --num-samples 500 \
+    --seed 42
+```
+
+**参数解释**:
+- `--dataset-path <LOCAL_DATASET_PATH>`: 本地 clone 或保存下来的原始数学数据集目录。
+- `--output-path <LOCAL_MATH500_PATH>`: 采样后生成的新数据集目录。
+- `--num-samples 500`: 抽样数量，默认就是 500。
+- `--seed 42`: 固定随机种子，便于复现实验。
+
 ### Phase 1: 离线激活值生成 (Activation Generation)
 
-从目标大模型中提取特定层的激活向量，由于使用的是 `math500-1.5b` preset，系统会自动保证仅包含推理数据集，保留 Query，并按 `\n\n` 进行截断。
+从目标大模型中提取特定层的激活向量。`math500-1.5b` preset 会保留完整 Query 作为上下文输入，并按 `\n\n` 对推理/解答部分生成 extraction mask。
 
 **执行命令**:
 ```bash
 python -m agora_sae.scripts.generate_activations \
     --preset math500-1.5b \
     --model <LOCAL_MODEL_PATH> \
-    --reasoning-datasets <LOCAL_DATASET_PATH> \
+    --reasoning-datasets <LOCAL_MATH500_PATH> \
     --output ./data/math500_activations \
-    --batch-size 32 \
+    --batch-size 16 \
     --buffer-size-mb 500 \
     --shard-size-mb 100
 ```
 **参数解释**:
 - `--preset math500-1.5b`: 使用此实验专属的预设配置（系统会自动设置好目标网络层数为第 12 层等）。
 - `--model <LOCAL_MODEL_PATH>`: 替换为你下载到本地的模型权重文件夹路径。
-- `--reasoning-datasets <LOCAL_DATASET_PATH>`: 替换为你本地的数学数据集路径。
+- `--reasoning-datasets <LOCAL_MATH500_PATH>`: 指向 Phase 0 生成的 500 条本地子集目录。
 - `--output ./data/math500_activations`: 所提取出来的特征向量（`.safetensors` 文件）最后要保存到的目标文件夹。
-- `--batch-size 32`: 每次喂给大模型进行前向推理计算的样本数量。如果显存不足（OOM），可以适当把这个数字调小（比如 16 或 8）。
+- `--batch-size 16`: 推荐先从 16 开始；如果显存足够，可以提高到 32。
 - `--buffer-size-mb 500`: 在把特征写入磁盘之前，会在内存里积攒并打乱（Shuffle）特征；这个设置决定了用于打乱的缓冲区大小（单位：MB）。设置得越大，训练数据随机性越好，但内存占用也更高。
 - `--shard-size-mb 100`: 保存到硬盘上的每个特征数据小切片（Shard）的最大体积限制（单位：MB）。
 
-- **数据流向**: `MixedTokenSource` 会加载数据集，经过 Parser 按预设的 `\n\n` 进行分段切割。然后注入 `OfflineActivationGenerator`，前向传播捕获第 12 层 (`layers.12.residual_stream`) 的激活张量。
+- **数据流向**: `MixedTokenSource` 会加载本地数据集，保留完整 Query 上下文，并仅对解题/solution 片段按 `\n\n` 分段生成 `extraction_mask`。然后注入 `OfflineActivationGenerator`，前向传播捕获第 12 层输入侧 residual stream 的激活张量。
 - **落地文件**: 生成的内容会被保存在 `./data/math500_activations` 下的多个紧凑的 `.safetensors` 分片文件中。
 
 ### Phase 2: 高吞吐训练 (Offline SAE Training)
@@ -93,6 +114,19 @@ python -m agora_sae.scripts.train_sae \
 - **数据流向**: `InfiniteShardLoader` (或 `ShardLoader`) 异步加载分片到内存打乱。训练主循环将其按 Batch 喂给 `TopKSAE` 模型。
 - **核心约束**: 损失函数主要由 MSE 重建损失，辅以死亡神经元抑制 (Aux Loss) 构成。内部会严格对 Decoder 权重应用 L2 Unit Norm 约束。
 
+如果暂时不想启用 Weights & Biases，可以使用下面这条可直接运行的命令：
+
+```bash
+python -m agora_sae.scripts.train_sae \
+    --preset math500-1.5b \
+    --shards ./data/math500_activations \
+    --checkpoint-dir ./checkpoints/math500-1.5b \
+    --batch-size 4096 \
+    --lr 5e-5 \
+    --steps 100000 \
+    --no-wandb
+```
+
 ### Phase 3: 特征解释与验证 (Evaluation)
 
 验证稀疏网络是否能“听懂”人类的数学意图。主要使用预留的验证集（或者手动 prompt 测试）。
@@ -100,6 +134,23 @@ python -m agora_sae.scripts.train_sae \
   - 特征 A: 专门在 `\n\n` 切断后的独立条件陈述句激活 (e.g., "Let $x$ be...")。
   - 特征 B: 在推断转折与纠错句激活 (e.g., "Wait, this is incorrect...").
   - 特征 C: 在最终计算化简步骤激活。
+
+**执行命令**:
+```bash
+python -m agora_sae.scripts.evaluate_sae \
+    --checkpoint ./checkpoints/math500-1.5b/checkpoint_final.pt \
+    --model <LOCAL_MODEL_PATH> \
+    --layer 12 \
+    --shards ./data/math500_activations \
+    --skip-ppl
+```
+
+**参数解释**:
+- `--checkpoint`: Phase 2 训练完成后生成的最终 SAE checkpoint。
+- `--model <LOCAL_MODEL_PATH>`: 本地模型权重路径。
+- `--layer 12`: 对应本实验使用的目标层。
+- `--shards ./data/math500_activations`: 可用于后续特征利用率分析。
+- `--skip-ppl`: 如果当前环境没有准备额外评测数据，先跳过 PPL 测试，保证命令可直接运行。
 
 ---
 

@@ -7,9 +7,8 @@ Multi-threaded loading of safetensors activation shards with optional delete-aft
 import os
 import random
 from pathlib import Path
-from typing import List, Optional, Iterator
+from typing import Iterator, List
 from concurrent.futures import ThreadPoolExecutor
-import threading
 
 import torch
 from torch.utils.data import IterableDataset
@@ -53,10 +52,6 @@ class ShardLoader(IterableDataset):
         self.prefetch_count = prefetch_count
         self.shuffle_shards = shuffle_shards
         self.num_workers = num_workers
-        
-        # Thread-safe prefetch queue
-        self._prefetch_queue = []
-        self._lock = threading.Lock()
         self._executor = None
         
     def get_shard_files(self) -> List[Path]:
@@ -70,22 +65,6 @@ class ShardLoader(IterableDataset):
         """Load a single shard file."""
         data = load_file(str(shard_path))
         return data["activations"]
-        
-    def _prefetch_shard(self, shard_path: Path):
-        """Prefetch a shard into memory."""
-        try:
-            data = self._load_shard(shard_path)
-            with self._lock:
-                self._prefetch_queue.append((shard_path, data))
-        except Exception as e:
-            print(f"Error prefetching {shard_path}: {e}")
-            
-    def _get_prefetched(self) -> Optional[tuple]:
-        """Get a prefetched shard if available."""
-        with self._lock:
-            if self._prefetch_queue:
-                return self._prefetch_queue.pop(0)
-        return None
         
     def __iter__(self) -> Iterator[torch.Tensor]:
         """
@@ -101,12 +80,13 @@ class ShardLoader(IterableDataset):
             
         # Start prefetch executor
         self._executor = ThreadPoolExecutor(max_workers=self.num_workers)
-        self._prefetch_queue = []
+        prefetched_futures = {}
         
         # Submit initial prefetch jobs
         prefetch_idx = 0
         for i in range(min(self.prefetch_count, len(shard_files))):
-            self._executor.submit(self._prefetch_shard, shard_files[i])
+            shard_path = shard_files[i]
+            prefetched_futures[shard_path] = self._executor.submit(self._load_shard, shard_path)
             prefetch_idx = i + 1
             
         # Buffer for partial batches
@@ -115,16 +95,14 @@ class ShardLoader(IterableDataset):
         for shard_idx, shard_path in enumerate(shard_files):
             # Submit next prefetch
             if prefetch_idx < len(shard_files):
-                self._executor.submit(self._prefetch_shard, shard_files[prefetch_idx])
+                next_shard = shard_files[prefetch_idx]
+                prefetched_futures[next_shard] = self._executor.submit(self._load_shard, next_shard)
                 prefetch_idx += 1
-                
-            # Try to get prefetched data
-            prefetched = self._get_prefetched()
-            
-            if prefetched and prefetched[0] == shard_path:
-                activations = prefetched[1]
+
+            future = prefetched_futures.pop(shard_path, None)
+            if future is not None:
+                activations = future.result()
             else:
-                # Load directly if not prefetched
                 activations = self._load_shard(shard_path)
                 
             # Shuffle within shard
@@ -163,7 +141,7 @@ class ShardLoader(IterableDataset):
             yield torch.cat(buffer, dim=0)
             
         # Cleanup
-        self._executor.shutdown(wait=False)
+        self._executor.shutdown(wait=True)
         
     def __len__(self) -> int:
         """Estimate number of batches (may not be exact)."""

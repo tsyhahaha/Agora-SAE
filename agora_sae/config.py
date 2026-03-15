@@ -2,6 +2,7 @@
 Global configuration for SAE training system.
 """
 
+import copy
 from dataclasses import dataclass, field
 from typing import List, Optional
 from pathlib import Path
@@ -31,7 +32,7 @@ class DataConfig:
     
     # New configurations for sentence-level extraction
     extraction_split_token: Optional[str] = None  # e.g., "\n\n"
-    retain_query: bool = False  # Keep full prompt context?
+    retain_query: bool = True  # Keep full prompt context?
 
 
 @dataclass
@@ -142,4 +143,4 @@ def get_config(preset: str = "deepseek-1.5b") -> Config:
     """Get a preset configuration."""
     if preset not in PRESETS:
         raise ValueError(f"Unknown preset: {preset}. Available: {list(PRESETS.keys())}")
-    return PRESETS[preset]
+    return copy.deepcopy(PRESETS[preset])
