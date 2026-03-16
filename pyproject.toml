@@ -50,6 +50,7 @@ flash = [
 agora-generate = "agora_sae.scripts.generate_activations:main"
 agora-train = "agora_sae.scripts.train_sae:main"
 agora-eval = "agora_sae.scripts.evaluate_sae:main"
+agora-paper-eval = "agora_sae.scripts.evaluate_paper_math500:main"
 agora-sample-dataset = "agora_sae.scripts.sample_dataset:main"
 
 [project.urls]

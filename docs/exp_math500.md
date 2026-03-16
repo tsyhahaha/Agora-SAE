@@ -23,8 +23,11 @@
   - **核心逻辑**：先把 reasoning 部分按 `\n\n` 切成 step，再只在每个 step 的 delimiter 位置提取目标层激活；若最后一个 step 后没有显式 delimiter，则回退到该 step 的末 token，确保每条样本至少贡献一个 step-level activation point。
   - **解释**：这样做把“怎么切 step”和“在哪个点取 activation”拆开了，后续可以换成别的规则甚至 LLM judge，而不需要重写激活生成主流程。
 
-### 1.3 SAE 架构与超参数 (Top-K SAE)
-基于 `1.5B` 模型的参数量规模与内存规划：
+### 1.3 SAE 架构与超参数
+
+当前仓库现成可跑通的是 `Top-K SAE + layer 12` 版本；但如果目标是**严格贴近论文复现主线**，则应当以论文 `Section 4.2` 的设置为准。
+
+**当前仓库实现**:
 - **目标层 (Hook Point)**: `layers.12.residual_stream` (中后期层，偏逻辑表达)
 - **模型维度 ($d_{model}$)**: 1,536
 - **膨胀系数 (Expansion Factor)**: 32x
@@ -32,6 +35,15 @@
 - **稀疏度 ($k$)**: 32 (Top-32 激活)
 - **学习率 (Learning Rate)**: 5e-5 (配合 Warmup)
 - **Batch Size (Offline Trainer)**: 4096 / 8192 (取决于截断后的单分片内存大小)
+
+**论文 target setting**:
+- **SAE 类型**: 标准 SAE，而不是 Top-K SAE
+- **目标维度 ($D$)**: 2,048
+- **Batch Size**: 1,024
+- **Learning Rate**: `1e-4`
+- **Warmup**: 前 10%
+- **稀疏强度**: `lambda = 2e-3`
+- **主分析层位**: final layer
 
 ---
 
@@ -130,28 +142,137 @@ python -m agora_sae.scripts.train_sae \
 
 ### Phase 3: 特征解释与验证 (Evaluation)
 
-验证稀疏网络是否能“听懂”人类的数学意图。主要使用预留的验证集（或者手动 prompt 测试）。
-- 抽取特征字典中的 Top-10 / Top-20 最频发活跃特征，还原到文本切片中观察。预期能捕捉到数学步骤特定的语义概念，例如：
-  - 特征 A: 专门在 `\n\n` 切断后的独立条件陈述句激活 (e.g., "Let $x$ be...")。
-  - 特征 B: 在推断转折与纠错句激活 (e.g., "Wait, this is incorrect...").
-  - 特征 C: 在最终计算化简步骤激活。
+论文复现主线的评估重点不是 `PPL` 或通用 feature 频率统计，而是回答下面三个问题：
+- SAE decoder columns 是否在几何上对应到可区分的 reasoning behaviors。
+- 这些 behaviors 是否能被人工或 judge 稳定标注为 `reflection / backtracking / other`。
+- 把对应的 behavior vector 注入回原模型后，能否因果性地改变推理风格，同时尽量保持答案正确。
+
+因此，`math500` 复现的 Phase 3 应以论文 `Section 4.3` 和 `Section 4.4.1` 为核心，而不是以当前仓库中的通用 `evaluate_sae` 脚本为核心。后者最多只能算补充诊断，不属于论文主评估流程。
+
+#### Step 3.1: 行为标注 (Behavior Labeling)
+
+对 `MATH500` 中每个 reasoning step 对应的 step-level activation，按论文设定标成以下三类：
+- `reflection`: 回看并重新检查前面步骤。
+- `backtracking`: 放弃当前路线，切换到另一种解法或分支。
+- `other`: 不属于以上两类的其余 step。
+
+论文这里采用的是 `LLM-as-a-judge`，并明确使用了 `GPT-5`。一阶段复现时应保留这一点，至少要保留“外部 judge 标注 reasoning step”这个核心流程。
 
 **执行命令**:
 ```bash
-python -m agora_sae.scripts.evaluate_sae \
+export OPENAI_API_KEY=<YOUR_OPENAI_API_KEY>
+
+python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
+    --dataset-path <LOCAL_MATH500_PATH> \
+    --output ./eval/math500_step_labels.jsonl \
+    --response-source model \
+    --model <LOCAL_MODEL_PATH> \
+    --judge openai \
+    --judge-model gpt-5 \
+    --max-samples 500 \
+    --max-new-tokens 512
+```
+
+**说明**:
+- 这条命令会先让目标模型对题目生成 response，再按 `\n\n` 切 step，最后对每个 step 做 judge 标注。
+- 如果你只是想先跑通本地流程，可以临时改成 `--judge heuristic`；但那不属于论文主线复现。
+
+**复现产物**:
+- 一份逐 step 标注后的表格或 JSONL。
+- 每条记录至少包含：`sample_id`、`step_id`、`step_text`、`label`。
+
+#### Step 3.2: SAE Decoder Geometry 分析
+
+在拿到逐 step 标签之后，论文主线做两件事：
+- 找出各类行为对应的 top-active channels / decoder columns。
+- 对 decoder columns 做 UMAP 投影，查看 `reflection`、`backtracking`、`other` 是否在几何上呈现可分离结构。
+
+论文还补充了 layer-wise 的 silhouette score 分析，用来量化不同层的行为可分离性；其中 later layers 通常更清晰。
+
+**一阶段复现的最低要求**:
+- 至少完成 final layer 上的 decoder column 可视化。
+- 至少能展示 `reflection` 和 `backtracking` 两类在 decoder space 中不是完全混在一起。
+
+**执行命令**:
+```bash
+python -m agora_sae.scripts.evaluate_paper_math500 analyze-geometry \
+    --labels ./eval/math500_step_labels.jsonl \
     --checkpoint ./checkpoints/math500-1.5b/checkpoint_final.pt \
     --model <LOCAL_MODEL_PATH> \
     --layer 12 \
-    --shards ./data/math500_activations \
-    --skip-ppl
+    --output-dir ./eval/geometry_math500 \
+    --embedding-method umap \
+    --plot-path ./eval/geometry_math500/decoder_umap.png
 ```
 
-**参数解释**:
-- `--checkpoint`: Phase 2 训练完成后生成的最终 SAE checkpoint。
-- `--model <LOCAL_MODEL_PATH>`: 本地模型权重路径。
-- `--layer 12`: 对应本实验使用的目标层。
-- `--shards ./data/math500_activations`: 可用于后续特征利用率分析。
-- `--skip-ppl`: 如果当前环境没有准备额外评测数据，先跳过 PPL 测试，保证命令可直接运行。
+**说明**:
+- 如果你已经有 final-layer SAE checkpoint，这里应把 `--layer` 改成对应 final layer。
+- `--embedding-method umap` 需要环境里安装 `umap-learn`；如果只是想先做降级版检查，可以改成 `pca`。
+
+**复现验收点**:
+- 能输出一张 decoder column 的二维投影图。
+- 图上 `reflection`、`backtracking` 对应的高分 columns 有可见聚类趋势。
+
+#### Step 3.3: 因果干预 (Causal Intervention)
+
+这是论文主评估里最关键的一步。流程是：
+- 从 final layer 中筛出 behavior-specific decoder columns。
+- 对同一类列向量取平均，得到一个 `reflection vector` 或 `backtracking vector`。
+- 在原模型推理时，把该向量注入到“每个 reasoning step 的最后一个 token”对应的隐藏状态。
+- 比较 `negative / vanilla / positive` 三种条件下，reflection 或 backtracking 的 step 数是否按预期变化。
+
+论文的核心观察不是 `PPL`，而是：
+- 推理风格是否随 intervention 强度稳定变化。
+- 最终答案是否尽量保持不变。
+- 这种 effect 是否能跨任务泛化。
+
+**一阶段复现的最低要求**:
+- 先在 `R1-1.5B + MATH500` 上完成 final-layer intervention。
+- 至少比较三种条件：`negative`、`vanilla`、`positive`。
+- 统计每种条件下的 `# reflection steps` / `# backtracking steps` 和最终答案正确率。
+
+**执行命令**:
+```bash
+python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
+    --dataset-path <LOCAL_MATH500_PATH> \
+    --geometry-summary ./eval/geometry_math500/geometry_summary.json \
+    --checkpoint ./checkpoints/math500-1.5b/checkpoint_final.pt \
+    --model <LOCAL_MODEL_PATH> \
+    --layer 12 \
+    --behavior reflection \
+    --output ./eval/intervention_reflection.jsonl \
+    --judge openai \
+    --judge-model gpt-5 \
+    --conditions negative:1.0,vanilla:0.0,positive:-1.0 \
+    --max-samples 32 \
+    --max-new-tokens 384
+```
+
+**说明**:
+- 这一步会从 geometry summary 里挑出目标行为的 top decoder columns，平均成一个 behavior vector，再对原模型做 `negative / vanilla / positive` 三种干预。
+- 当前命令默认使用 `reflection` 做示例；如果你要复现实验里的 `backtracking`，只需改 `--behavior backtracking`。
+
+**复现产物**:
+- 一张类似论文 Figure 5 / Figure 6 的结果汇总表。
+- 每个条件下至少记录：`task_id`、`condition`、`# reflection steps`、`# backtracking steps`、`final_answer`、`is_correct`。
+
+#### Step 3.4: 跨任务泛化
+
+如果要继续贴近论文主线，下一步不是做通用 PPL，而是把在 `MATH500` 学到的 behavior vectors 拿到其他任务上验证。
+
+论文正文里列出的方向包括：
+- `AIME 2025`
+- `AMC23`
+- 以及跨领域的 `GPQA-Diamond`、`KnowLogic`
+
+对一阶段复现来说，这一步可以放在 `MATH500` 内部因果干预之后，但仍然属于论文主线，不属于工程附加项。
+
+**当前仓库状态**:
+- 目前同一套 intervention 脚本已经能复用于别的数据集，但还没有现成的任务封装模板。
+
+#### 当前脚本的定位
+
+当前仓库里的 [evaluate_sae.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_sae.py) 仍然可以保留，但它不应再被写成 `math500` 论文复现的主评估命令。论文主线请优先使用新的 [evaluate_paper_math500.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_paper_math500.py)。
 
 ---
 
@@ -179,4 +300,7 @@ python -m agora_sae.scripts.evaluate_sae \
 
 1. **成功产出 MATH500 激活文件**: 在 `./data/math500_activations` 目录上生成有效的 `.safetensors` 分片，且分片内的激活对应于 reasoning step delimiter 的 token 位置，而不是整段 token span。
 2. **训练收敛**: Wandb 监控可见 `L2 Reconstruct Error` 平稳下降至预期水平（L2 Ratio $< 5\%$），且由于 $k=32$，L0 激活特征严格固定在 `32`。
-3. **低死神经元率 (Dead Latents)**: 通过设置 `Aux Loss Weight`=`1/32`，确保在 MATH500 特定领域的子集内，特征死亡率处于极低水平 (`< 1%`)。
+3. **行为标注可落地**: 至少完成 `reflection / backtracking / other` 的逐 step 标注，并能回溯到对应激活点。
+4. **Decoder Geometry 可解释**: final layer 上，`reflection` 与 `backtracking` 对应的高分 decoder columns 在 UMAP 空间中应表现出可见结构，而不是完全混杂。
+5. **因果干预有效**: 对 behavior vector 做 `negative / vanilla / positive` 干预后，相关行为步数应当按预期变化。
+6. **答案尽量保持稳定**: 干预主要改变 reasoning style，而不是简单破坏求解能力；至少在一组代表性数学题上，最终答案应尽量保持一致或只出现轻微波动。

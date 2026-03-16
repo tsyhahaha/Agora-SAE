@@ -78,12 +78,19 @@ class ActivationPointSelector:
         """Build a token mask for the selected activation points."""
         mask = torch.zeros(offsets.shape[0], dtype=torch.bool)
 
-        for step in steps:
-            selected_index = self._select_index_for_step(offsets, step)
+        for selected_index in self.select_indices(offsets, steps):
             if selected_index is not None:
                 mask[selected_index] = True
 
         return mask
+
+    def select_indices(
+        self,
+        offsets: torch.Tensor,
+        steps: Sequence[ReasoningStep],
+    ) -> List[Optional[int]]:
+        """Return the token index selected for each reasoning step."""
+        return [self._select_index_for_step(offsets, step) for step in steps]
 
     def _select_index_for_step(
         self,
