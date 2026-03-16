@@ -13,6 +13,7 @@ class ModelConfig:
     """Configuration for the target LLM model."""
     model_name: str = "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     hook_layer: int = 12  # Layer to extract activations from
+    num_layers: Optional[int] = None  # Total transformer layers, if known
     d_model: int = 1536   # Model hidden dimension
     
 
@@ -103,6 +104,7 @@ PRESETS = {
         model=ModelConfig(
             model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             hook_layer=12,
+            num_layers=28,
             d_model=1536
         ),
         sae=SAEConfig(expansion_factor=32, k=32)
@@ -111,6 +113,7 @@ PRESETS = {
         model=ModelConfig(
             model_name="Qwen/Qwen3-8B",
             hook_layer=16,
+            num_layers=36,
             d_model=4096
         ),
         sae=SAEConfig(expansion_factor=32, k=64)
@@ -119,6 +122,7 @@ PRESETS = {
         model=ModelConfig(
             model_name="Qwen/QwQ-32B",
             hook_layer=24,
+            num_layers=64,
             d_model=5120
         ),
         sae=SAEConfig(expansion_factor=32, k=64)
@@ -127,6 +131,7 @@ PRESETS = {
         model=ModelConfig(
             model_name="deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             hook_layer=12,
+            num_layers=28,
             d_model=1536
         ),
         data=DataConfig(

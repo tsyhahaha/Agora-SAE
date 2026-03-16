@@ -56,7 +56,30 @@ python -m agora_sae.scripts.train_sae \
     --wandb-run math500-1.5b-run1
 ```
 
+如果你要做逐层扫描训练，可以直接按固定步长遍历层，并确保 `final layer` 一定被包含进去：
+
+```bash
+python -m agora_sae.scripts.train_sae \
+    --preset math500-1.5b \
+    --layer-range 0:24 \
+    --layer-step 4 \
+    --final-layer 27 \
+    --shards-template ./data/math500_activations/layer_{layer} \
+    --checkpoint-dir ./checkpoints/math500-layer-scan \
+    --batch-size 4096 \
+    --lr 5e-5 \
+    --steps 100000 \
+    --no-wandb
+```
+
+说明：
+- 上面这条命令会训练 `0,4,8,12,16,20,24,27` 这些层；`27` 是自动补上的 final layer。
+- 如果 `--shards` 或 `--checkpoint-dir` 没有写 `{layer}`，多层模式会自动落到 `.../layer_<n>` 这种目录布局。
+- 多层训练会额外输出一份 `scan_manifest.json`，方便后续几何扫描和 intervention 直接复用。
+
 ### 4. 评估模型
+
+`MATH500` 论文复现请优先参考 [docs/exp_math500.md](/Users/siyuantao/repos/Agora-SAE/docs/exp_math500.md) 里的 `agora-paper-eval` 流程。下面这条命令仍然是通用 SAE 诊断脚本，不是论文主评估：
 
 ```bash
 python -m agora_sae.scripts.evaluate_sae \
@@ -72,6 +95,7 @@ python -m agora_sae.scripts.evaluate_sae \
 - `math500-1.5b` preset 会保留完整 query 作为上下文输入，并只在 reasoning step 的分隔点上提取激活。
 - 对有限本地数据集，`generate_activations` 默认单轮跑完后自动结束；只有显式加 `--repeat-data` 才会循环重跑。
 - 如果 `--batch-size 16` 显存还有余量，可以再提高到 `32`。
+- `train_sae` 现在支持 `--layers`、`--layer-range`、`--layer-step`；只要开启多层模式，就会自动把 final layer 一并纳入训练计划。
 - 如果你把项目安装成包，也可以直接使用 `agora-sample-dataset`、`agora-generate`、`agora-train`、`agora-eval`。
 
 ### 常用自定义命令

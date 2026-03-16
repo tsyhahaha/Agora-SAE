@@ -1,61 +1,111 @@
-# 实验文档：MATH500 上的 SAE 训练 (Experiment 1)
+# 实验文档：MATH500 论文复现主线
 
-**实验代号**：`Exp-01-MATH500-1.5B`
-**目标**：在小规模数学推理数据集 (MATH500) 上走通 SAE (Sparse Autoencoder) 的离线提取与训练全流程，验证特定模型下的数据处理切割逻辑与特征提取有效性。
+**实验代号**: `Exp-01-MATH500-1.5B`
+
+**文档目标**:
+- 给出一条当前仓库内可逐步执行的 `MATH500` 复现路径。
+- 优先对齐论文主线: `step-level behavior labeling -> final-layer geometry -> causal intervention`。
+- 同时把 `layer-wise` 扫描所需的激活生成和 SAE 训练路径沉淀下来，为后续跨层 silhouette 分析做准备。
 
 ---
 
-## 1. 实验核心配置
+## 1. 先说结论
 
-### 1.1 模型与数据集路径
+如果你的目标是“先达到论文复现的一阶段核心结果”，推荐按下面顺序跑:
+
+1. 采样固定 `MATH500`
+2. 生成 `final layer` 的 step-delimiter activations
+3. 训练 `final layer SAE`
+4. 做 step 行为标注
+5. 做 `final layer` 的 geometry 分析
+6. 做 `final layer` intervention
+
+如果你还要补论文里的 `layer-wise silhouette` 分析，再额外做:
+
+7. 按固定步长生成多层 activation
+8. 按相同步长训练多层 SAE
+9. 逐层跑 geometry，并汇总各层 `silhouette_score`
+
+一句话概括:
+- `final layer` 主线是现在最该优先跑通的复现路径。
+- `layer-wise scan` 是主线之外的必要扩展，但当前仓库还是“一层一层跑 geometry”，还没有自动化的多层 eval 汇总 CLI。
+
+---
+
+## 2. 当前仓库与论文目标的关系
+
+### 2.1 当前仓库已经对齐的部分
+
+- 激活提取已经改成 `step delimiter`，不再保存整段 `token span`。
+- 有限本地数据集默认单轮结束，不会无限循环生成 activation。
+- `paper-style eval` 已经有专门入口 [evaluate_paper_math500.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_paper_math500.py)，覆盖:
+  - `label-steps`
+  - `analyze-geometry`
+  - `run-intervention`
+- 训练侧已经支持多层扫描:
+  - `--layers`
+  - `--layer-range`
+  - `--layer-step`
+  - `--final-layer`
+
+### 2.2 当前仓库和论文仍然存在的差异
+
+- 论文 `Section 4.2` 用的是**标准 SAE**，当前仓库训练入口还是 **Top-K SAE**。
+- 论文正文的核心图和 intervention 主结果聚焦 `final layer`；当前仓库的 `math500-1.5b` preset 默认层仍是 `12`，所以走论文主线时需要显式传 `--layer 27`。
+- 论文里 layer-wise 几何量化是统一汇总出来的；当前仓库要先逐层生成 `geometry_summary.json`，再手动汇总。
+
+所以这份文档的定位是:
+- 先把**论文复现主线**在当前代码库里跑通。
+- 明确保留当前仓库的一个剩余偏差: `Top-K SAE != 标准 SAE`。
+
+---
+
+## 3. 实验固定输入
+
+### 3.1 模型与数据
+
 - **Target Model**: `deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B`
-  - **Local Path**: `<LOCAL_MODEL_PATH>` (替换为你下载到本地的模型权重路径)
-- **Source Dataset**: `MATH`
-  - **Local Path**: `<LOCAL_DATASET_PATH>` (替换为你下载到本地的数据集路径)
-- **Sampled Dataset**: `MATH500`
-  - **Local Path**: `<LOCAL_MATH500_PATH>` (由下文的采样脚本生成)
+- **Local Model Path**: `<LOCAL_MODEL_PATH>`
+- **Source Dataset Path**: `<LOCAL_DATASET_PATH>`
+- **Sampled Dataset Path**: `<LOCAL_MATH500_PATH>`
 
-### 1.2 数据采样与处理逻辑 (Data Ingestion)
-- **MATH500 抽样**:
-  - 从全量 MATH 数据集中，设置固定的 Random Seed，**随机抽取 500 条数据**作为本次实验的子集（`MATH500`）。
-- **Step 级切割与激活取点**:
-  - 针对这 500 条数据，**保留完整的 Query 与最终 reasoning / Solution 作为模型上下文输入**，不破坏原始推理上下文。
-  - **核心逻辑**：先把 reasoning 部分按 `\n\n` 切成 step，再只在每个 step 的 delimiter 位置提取目标层激活；若最后一个 step 后没有显式 delimiter，则回退到该 step 的末 token，确保每条样本至少贡献一个 step-level activation point。
-  - **解释**：这样做把“怎么切 step”和“在哪个点取 activation”拆开了，后续可以换成别的规则甚至 LLM judge，而不需要重写激活生成主流程。
+### 3.2 Step 切分与 activation 取点
 
-### 1.3 SAE 架构与超参数
+当前复现路径固定采用:
 
-当前仓库现成可跑通的是 `Top-K SAE + layer 12` 版本；但如果目标是**严格贴近论文复现主线**，则应当以论文 `Section 4.2` 的设置为准。
+- `step delimiter = "\n\n"`
+- 对 reasoning 按 `\n\n` 切 step
+- 每个 step 只取一个 activation point:
+  - 优先取该 step 对应的 delimiter token
+  - 如果最后一个 step 后没有显式 delimiter，则回退到该 step 末 token
 
-**当前仓库实现**:
-- **目标层 (Hook Point)**: `layers.12.residual_stream` (中后期层，偏逻辑表达)
-- **模型维度 ($d_{model}$)**: 1,536
-- **膨胀系数 (Expansion Factor)**: 32x
-- **字典维度 ($d_{sae}$)**: 49,152
-- **稀疏度 ($k$)**: 32 (Top-32 激活)
-- **学习率 (Learning Rate)**: 5e-5 (配合 Warmup)
-- **Batch Size (Offline Trainer)**: 4096 / 8192 (取决于截断后的单分片内存大小)
+这条策略的目的，是把:
+- “怎么切 step”
+- “在哪个点取 activation”
 
-**论文 target setting**:
-- **SAE 类型**: 标准 SAE，而不是 Top-K SAE
-- **目标维度 ($D$)**: 2,048
-- **Batch Size**: 1,024
-- **Learning Rate**: `1e-4`
-- **Warmup**: 前 10%
-- **稀疏强度**: `lambda = 2e-3`
-- **主分析层位**: final layer
+从代码结构上解耦开。后续如果你要换规则式切分、句子级切分、或 LLM judge 给出的 step anchor，activation 主流程不用重写。
+
+### 3.3 论文主线建议层位
+
+对 `DeepSeek-R1-Distill-Qwen-1.5B`，当前仓库里我们把:
+
+- `final layer index = 27`
+
+作为论文主线默认层位。
+
+因此:
+- `final layer` 主线命令都建议显式写 `--layer 27`
+- `layer-wise scan` 的示例层集合统一使用:
+  - `0, 4, 8, 12, 16, 20, 24, 27`
+
+这样既能按固定步长抽层，也能保证 `final layer` 一定包含进去。
 
 ---
 
-## 2. 实验执行流程与具体命令
+## 4. Phase 0: 生成固定的 MATH500 子集
 
-本实验遵循项目中定义的 **Staged Offline** 架构，分为激活生成、SAE 训练和特征分析三个阶段。
+先从本地数学数据集中采样固定 `500` 条，后续所有实验都基于这个固定子集。
 
-### Phase 0: 生成本地 `MATH500` 子集
-
-先从本地全量数学数据集中抽取固定 500 条，保证后续实验可复现。
-
-**执行命令**:
 ```bash
 python -m agora_sae.scripts.sample_dataset \
     --dataset-path <LOCAL_DATASET_PATH> \
@@ -64,101 +114,170 @@ python -m agora_sae.scripts.sample_dataset \
     --seed 42
 ```
 
-**参数解释**:
-- `--dataset-path <LOCAL_DATASET_PATH>`: 本地 clone 或保存下来的原始数学数据集目录。
-- `--output-path <LOCAL_MATH500_PATH>`: 采样后生成的新数据集目录。
-- `--num-samples 500`: 抽样数量，默认就是 500。
-- `--seed 42`: 固定随机种子，便于复现实验。
+建议先确认输出目录里已经是一个可被 Hugging Face `datasets` 正常读取的本地数据集目录，然后再进入下一阶段。
 
-### Phase 1: 离线激活值生成 (Activation Generation)
+---
 
-从目标大模型中提取特定层的激活向量。`math500-1.5b` preset 会保留完整 Query 作为上下文输入，并按 `\n\n` 划分 reasoning step，只保存每个 step 的 delimiter activation。
+## 5. Phase 1: 生成 activations
 
-**执行命令**:
+这一阶段分成两条路径:
+
+- `Phase 1A`: 论文主线必须跑的 `final layer activation`
+- `Phase 1B`: 为 layer-wise scan 准备的多层 activation
+
+### Phase 1A: final layer activation
+
+这是复现主线的最低要求。先只生成 `layer 27` 的 activations。
+
 ```bash
 python -m agora_sae.scripts.generate_activations \
     --preset math500-1.5b \
     --model <LOCAL_MODEL_PATH> \
+    --layer 27 \
     --reasoning-datasets <LOCAL_MATH500_PATH> \
-    --output ./data/math500_activations \
+    --output ./data/math500_activations/layer_27 \
     --batch-size 16 \
     --buffer-size-mb 500 \
     --shard-size-mb 100
 ```
-**参数解释**:
-- `--preset math500-1.5b`: 使用此实验专属的预设配置（系统会自动设置好目标网络层数为第 12 层等）。
-- `--model <LOCAL_MODEL_PATH>`: 替换为你下载到本地的模型权重文件夹路径。
-- `--reasoning-datasets <LOCAL_MATH500_PATH>`: 指向 Phase 0 生成的 500 条本地子集目录。
-- `--output ./data/math500_activations`: 所提取出来的特征向量（`.safetensors` 文件）最后要保存到的目标文件夹。
-- `--batch-size 16`: 推荐先从 16 开始；如果显存足够，可以提高到 32。
-- `--buffer-size-mb 500`: 在把特征写入磁盘之前，会在内存里积攒并打乱（Shuffle）特征；这个设置决定了用于打乱的缓冲区大小（单位：MB）。设置得越大，训练数据随机性越好，但内存占用也更高。
-- `--shard-size-mb 100`: 保存到硬盘上的每个特征数据小切片（Shard）的最大体积限制（单位：MB）。
-- `--max-batches`: 可选，只用于 smoke test；默认会在本地有限数据集遍历完一轮后自动停止，不会无限循环。
 
-- **数据流向**: `MixedTokenSource` 会加载本地数据集，保留完整 Query 上下文，先对 reasoning 片段做 step 切分，再用 activation point selector 只标记各个 step delimiter 对应的 token 位置。然后注入 `OfflineActivationGenerator`，前向传播捕获第 12 层输入侧 residual stream 的激活张量。
-- **落地文件**: 生成的内容会被保存在 `./data/math500_activations` 下的多个紧凑的 `.safetensors` 分片文件中。
+这条命令的关键点:
+- 虽然用了 `math500-1.5b` preset，但这里显式传了 `--layer 27`，所以会覆盖 preset 默认的 `layer 12`。
+- 对本地有限数据集，脚本默认单轮结束，不需要额外传 `--max-batches`。
+- 输出目录建议直接按 `layer_x` 组织，方便后面训练侧和 layer-wise 扫描复用。
 
-### Phase 2: 高吞吐训练 (Offline SAE Training)
+**验收点**:
+- `./data/math500_activations/layer_27` 下出现 `.safetensors` 分片
+- 生成过程会自然结束，而不是无限循环
 
-消耗存储在磁盘上的激活文件，通过 Top-K 稀疏自编码器拟合特征字典。
+### Phase 1B: 可选的多层 activation 扫描
 
-**执行命令**:
+如果你要复现论文里的 layer-wise 几何量化，需要先为多个层分别生成 activations。
+
+当前仓库的 activation 生成还是**单层一次跑一个 layer**，所以这里建议直接用一个 shell loop。
+
 ```bash
-python -m agora_sae.scripts.train_sae \
-    --preset math500-1.5b \
-    --shards ./data/math500_activations \
-    --checkpoint-dir ./checkpoints/math500-1.5b \
-    --batch-size 4096 \
-    --lr 5e-5 \
-    --steps 100000 \
-    --wandb-project agora-sae \
-    --wandb-run math500-1.5b-run1
+for layer in 0 4 8 12 16 20 24 27; do
+  python -m agora_sae.scripts.generate_activations \
+      --preset math500-1.5b \
+      --model <LOCAL_MODEL_PATH> \
+      --layer ${layer} \
+      --reasoning-datasets <LOCAL_MATH500_PATH> \
+      --output ./data/math500_activations/layer_${layer} \
+      --batch-size 16 \
+      --buffer-size-mb 500 \
+      --shard-size-mb 100
+done
 ```
-**参数解释**:
-- `--preset math500-1.5b`: 沿用和提取阶段相同的预设配置，以确保自动使用对应的特征维度（例如 32 倍膨胀）和 Top-K（如 K=32）。
-- `--shards ./data/math500_activations`: 指向上一个阶段提取并保存激活特征分片文件的那个文件夹。
-- `--checkpoint-dir ./checkpoints/math500-1.5b`: SAE 模型自身训练完毕（或中途保存）时，其权重的存储位置目录。
-- `--batch-size 4096`: SAE 字典模型每次更新权重时“看”多少个特征标记（Tokens）。仅仅训练这个小模型而不涉及大模型语言推理，显存非常充裕，可以设置得大一些（如 4096 甚至 8192）。
-- `--lr 5e-5`: 学习率（Learning Rate），控制 SAE 每次通过数据学习并更新字典权重的步幅大小。
-- `--steps 100000`: SAE 训练过程要进行的优化步数，即总共跑多少次批次（Batch）的数据。
-- `--wandb-project`: 在 Weights & Biases 监控系统记录指标时所用的项目名称。（由于你是本地运行，如果不需要监控记录面板，可以在命令参数中附加 `--no-wandb` 将其关闭）。
-- `--wandb-run`: 在给定的追踪项目里，本实验的具体展示名称。
 
-- **数据流向**: `InfiniteShardLoader` (或 `ShardLoader`) 异步加载分片到内存打乱。训练主循环将其按 Batch 喂给 `TopKSAE` 模型。
-- **核心约束**: 损失函数主要由 MSE 重建损失，辅以死亡神经元抑制 (Aux Loss) 构成。内部会严格对 Decoder 权重应用 L2 Unit Norm 约束。
+**为什么这里必须先做 Phase 1B 再做多层训练**:
+- 多层 SAE 训练依赖“每一层都有自己的 activation shards”
+- 当前训练侧已经支持多层 sweep，但不会替你自动生成多层 activation
 
-如果暂时不想启用 Weights & Biases，可以使用下面这条可直接运行的命令：
+**验收点**:
+- `./data/math500_activations/layer_0`
+- `./data/math500_activations/layer_4`
+- ...
+- `./data/math500_activations/layer_27`
+
+这些目录都已经存在，并各自包含 activation 分片。
+
+---
+
+## 6. Phase 2: 训练 SAE
+
+这一阶段同样分成两条路径:
+
+- `Phase 2A`: 先训练 `final layer SAE`
+- `Phase 2B`: 再训练多层 SAE，为跨层几何分析做准备
+
+### Phase 2A: 训练 final layer SAE
 
 ```bash
 python -m agora_sae.scripts.train_sae \
     --preset math500-1.5b \
-    --shards ./data/math500_activations \
-    --checkpoint-dir ./checkpoints/math500-1.5b \
+    --layer 27 \
+    --shards ./data/math500_activations/layer_27 \
+    --checkpoint-dir ./checkpoints/math500-final-layer \
     --batch-size 4096 \
     --lr 5e-5 \
     --steps 100000 \
     --no-wandb
 ```
 
-### Phase 3: 特征解释与验证 (Evaluation)
+这条命令是当前仓库里最接近论文主线的训练入口。
 
-论文复现主线的评估重点不是 `PPL` 或通用 feature 频率统计，而是回答下面三个问题：
-- SAE decoder columns 是否在几何上对应到可区分的 reasoning behaviors。
-- 这些 behaviors 是否能被人工或 judge 稳定标注为 `reflection / backtracking / other`。
-- 把对应的 behavior vector 注入回原模型后，能否因果性地改变推理风格，同时尽量保持答案正确。
+**关键说明**:
+- 这里继续显式传 `--layer 27`，确保训练配置和 activation 来源一致。
+- 当前实现仍然训练的是 `Top-K SAE`，不是论文中的标准 SAE；这是当前仓库里还没有消除的一处剩余偏差。
 
-因此，`math500` 复现的 Phase 3 应以论文 `Section 4.3` 和 `Section 4.4.1` 为核心，而不是以当前仓库中的通用 `evaluate_sae` 脚本为核心。后者最多只能算补充诊断，不属于论文主评估流程。
+**验收点**:
+- `./checkpoints/math500-final-layer/checkpoint_final.pt` 成功产出
 
-#### Step 3.1: 行为标注 (Behavior Labeling)
+### Phase 2B: 可选的多层 SAE 扫描训练
 
-对 `MATH500` 中每个 reasoning step 对应的 step-level activation，按论文设定标成以下三类：
-- `reflection`: 回看并重新检查前面步骤。
-- `backtracking`: 放弃当前路线，切换到另一种解法或分支。
-- `other`: 不属于以上两类的其余 step。
+如果你已经完成 `Phase 1B` 的多层 activation 生成，就可以直接让训练脚本按层扫描。
 
-论文这里采用的是 `LLM-as-a-judge`，并明确使用了 `GPT-5`。一阶段复现时应保留这一点，至少要保留“外部 judge 标注 reasoning step”这个核心流程。
+```bash
+python -m agora_sae.scripts.train_sae \
+    --preset math500-1.5b \
+    --layer-range 0:24 \
+    --layer-step 4 \
+    --final-layer 27 \
+    --shards ./data/math500_activations \
+    --checkpoint-dir ./checkpoints/math500-layer-scan \
+    --batch-size 4096 \
+    --lr 5e-5 \
+    --steps 100000 \
+    --no-wandb
+```
 
-**执行命令**:
+这条命令会顺序训练:
+
+- `0`
+- `4`
+- `8`
+- `12`
+- `16`
+- `20`
+- `24`
+- `27`
+
+其中 `27` 是自动补上的 `final layer`。
+
+脚本会默认把输入 shards 解析成:
+- `./data/math500_activations/layer_0`
+- `./data/math500_activations/layer_4`
+- ...
+
+输出 checkpoint 解析成:
+- `./checkpoints/math500-layer-scan/layer_0`
+- `./checkpoints/math500-layer-scan/layer_4`
+- ...
+
+并自动写出:
+- `./checkpoints/math500-layer-scan/scan_manifest.json`
+
+这份 manifest 后面可以作为 layer-wise eval 的统一索引。
+
+**注意**:
+- 如果你只跑了 `Phase 1A` 的 `layer_27` activation，就不要直接执行这条命令。
+- 多层训练之前，先确认多层 activation 目录都已经存在。
+
+---
+
+## 7. Phase 3: 论文主线 eval
+
+这里的评估目标不是通用重建误差或 PPL，而是论文最核心的三步:
+
+1. `Behavior labeling`
+2. `Decoder geometry`
+3. `Causal intervention`
+
+### Step 3.1: 做 step 行为标注
+
+先让目标模型对 `MATH500` 生成 response，再按 `\n\n` 切 step，最后用外部 judge 给 step 打标。
+
 ```bash
 export OPENAI_API_KEY=<YOUR_OPENAI_API_KEY>
 
@@ -173,72 +292,57 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
     --max-new-tokens 512
 ```
 
-**说明**:
-- 这条命令会先让目标模型对题目生成 response，再按 `\n\n` 切 step，最后对每个 step 做 judge 标注。
-- 如果你只是想先跑通本地流程，可以临时改成 `--judge heuristic`；但那不属于论文主线复现。
+**产物**:
+- `./eval/math500_step_labels.jsonl`
 
-**复现产物**:
-- 一份逐 step 标注后的表格或 JSONL。
-- 每条记录至少包含：`sample_id`、`step_id`、`step_text`、`label`。
+**建议检查**:
+- 抽样看几条记录，确认存在:
+  - `sample_id`
+  - `step_id`
+  - `step_text`
+  - `label`
 
-#### Step 3.2: SAE Decoder Geometry 分析
+如果你只是要先跑通本地流程，可以把 `--judge openai` 改成 `--judge heuristic`，但那不属于论文主线。
 
-在拿到逐 step 标签之后，论文主线做两件事：
-- 找出各类行为对应的 top-active channels / decoder columns。
-- 对 decoder columns 做 UMAP 投影，查看 `reflection`、`backtracking`、`other` 是否在几何上呈现可分离结构。
+### Step 3.2: 做 final-layer geometry 分析
 
-论文还补充了 layer-wise 的 silhouette score 分析，用来量化不同层的行为可分离性；其中 later layers 通常更清晰。
+这是论文主线里最先该跑通的 geometry 结果。
 
-**一阶段复现的最低要求**:
-- 至少完成 final layer 上的 decoder column 可视化。
-- 至少能展示 `reflection` 和 `backtracking` 两类在 decoder space 中不是完全混在一起。
-
-**执行命令**:
 ```bash
 python -m agora_sae.scripts.evaluate_paper_math500 analyze-geometry \
     --labels ./eval/math500_step_labels.jsonl \
-    --checkpoint ./checkpoints/math500-1.5b/checkpoint_final.pt \
+    --checkpoint ./checkpoints/math500-final-layer/checkpoint_final.pt \
     --model <LOCAL_MODEL_PATH> \
-    --layer 12 \
-    --output-dir ./eval/geometry_math500 \
+    --layer 27 \
+    --output-dir ./eval/geometry_math500_final \
     --embedding-method umap \
-    --plot-path ./eval/geometry_math500/decoder_umap.png
+    --plot-path ./eval/geometry_math500_final/decoder_umap.png
 ```
 
-**说明**:
-- 如果你已经有 final-layer SAE checkpoint，这里应把 `--layer` 改成对应 final layer。
-- `--embedding-method umap` 需要环境里安装 `umap-learn`；如果只是想先做降级版检查，可以改成 `pca`。
+**验收点**:
+- `./eval/geometry_math500_final/geometry_summary.json`
+- `./eval/geometry_math500_final/decoder_points.jsonl`
+- `./eval/geometry_math500_final/decoder_umap.png`
 
-**复现验收点**:
-- 能输出一张 decoder column 的二维投影图。
-- 图上 `reflection`、`backtracking` 对应的高分 columns 有可见聚类趋势。
+其中 `geometry_summary.json` 至少应包含:
+- `silhouette_score`
+- `feature_assignments`
+- `num_labeled_steps`
+- `num_captured_steps`
 
-#### Step 3.3: 因果干预 (Causal Intervention)
+### Step 3.3: 做 final-layer intervention
 
-这是论文主评估里最关键的一步。流程是：
-- 从 final layer 中筛出 behavior-specific decoder columns。
-- 对同一类列向量取平均，得到一个 `reflection vector` 或 `backtracking vector`。
-- 在原模型推理时，把该向量注入到“每个 reasoning step 的最后一个 token”对应的隐藏状态。
-- 比较 `negative / vanilla / positive` 三种条件下，reflection 或 backtracking 的 step 数是否按预期变化。
+拿 `geometry_summary.json` 里的 behavior-specific decoder columns，构造行为向量，再注入回原模型。
 
-论文的核心观察不是 `PPL`，而是：
-- 推理风格是否随 intervention 强度稳定变化。
-- 最终答案是否尽量保持不变。
-- 这种 effect 是否能跨任务泛化。
+下面先以 `reflection` 为例:
 
-**一阶段复现的最低要求**:
-- 先在 `R1-1.5B + MATH500` 上完成 final-layer intervention。
-- 至少比较三种条件：`negative`、`vanilla`、`positive`。
-- 统计每种条件下的 `# reflection steps` / `# backtracking steps` 和最终答案正确率。
-
-**执行命令**:
 ```bash
 python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
     --dataset-path <LOCAL_MATH500_PATH> \
-    --geometry-summary ./eval/geometry_math500/geometry_summary.json \
-    --checkpoint ./checkpoints/math500-1.5b/checkpoint_final.pt \
+    --geometry-summary ./eval/geometry_math500_final/geometry_summary.json \
+    --checkpoint ./checkpoints/math500-final-layer/checkpoint_final.pt \
     --model <LOCAL_MODEL_PATH> \
-    --layer 12 \
+    --layer 27 \
     --behavior reflection \
     --output ./eval/intervention_reflection.jsonl \
     --judge openai \
@@ -248,59 +352,159 @@ python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
     --max-new-tokens 384
 ```
 
-**说明**:
-- 这一步会从 geometry summary 里挑出目标行为的 top decoder columns，平均成一个 behavior vector，再对原模型做 `negative / vanilla / positive` 三种干预。
-- 当前命令默认使用 `reflection` 做示例；如果你要复现实验里的 `backtracking`，只需改 `--behavior backtracking`。
+如果你要做 `backtracking`，只需要把:
+- `--behavior reflection`
 
-**复现产物**:
-- 一张类似论文 Figure 5 / Figure 6 的结果汇总表。
-- 每个条件下至少记录：`task_id`、`condition`、`# reflection steps`、`# backtracking steps`、`final_answer`、`is_correct`。
+改成:
+- `--behavior backtracking`
 
-#### Step 3.4: 跨任务泛化
-
-如果要继续贴近论文主线，下一步不是做通用 PPL，而是把在 `MATH500` 学到的 behavior vectors 拿到其他任务上验证。
-
-论文正文里列出的方向包括：
-- `AIME 2025`
-- `AMC23`
-- 以及跨领域的 `GPQA-Diamond`、`KnowLogic`
-
-对一阶段复现来说，这一步可以放在 `MATH500` 内部因果干预之后，但仍然属于论文主线，不属于工程附加项。
-
-**当前仓库状态**:
-- 目前同一套 intervention 脚本已经能复用于别的数据集，但还没有现成的任务封装模板。
-
-#### 当前脚本的定位
-
-当前仓库里的 [evaluate_sae.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_sae.py) 仍然可以保留，但它不应再被写成 `math500` 论文复现的主评估命令。论文主线请优先使用新的 [evaluate_paper_math500.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_paper_math500.py)。
+**验收点**:
+- 输出 JSONL 里，每个条件下至少能看到:
+  - 行为步数统计
+  - 最终答案
+  - 正确性字段
 
 ---
 
-## 3. 计算资源需求估算
+## 8. Phase 4: layer-wise geometry 扫描
 
-在此预设规模下 (`Qwen-1.5B`, $d_{model}=1536$, Expansion$=32x$), 资源消耗预估如下：
+这一阶段对应论文里“不同层行为可分离性”的量化分析。
 
-### 3.1 算力与显存 (VRAM)
-- **阶段一 (生成激活)**:
-  - 模型本身 (1.5B 参数，bf16精度) 占用约 ~3 GB。
-  - 推理时 KV Cache 和中间激活张量（Batch Size=32, Seq Len=2048）占用约 6-8 GB。
-  - **总显存需求**: 约 `12 GB`。单张 RTX 3090/4090 (24GB) 或主流服务器 GPU 足以跑满。
-- **阶段二 (SAE 训练)**:
-  - SAE 参数量：Encoder 权重 ($1536 \times 49152$) + Decoder 权重 ($49152 \times 1536$) 约 150M 参数。FP32 存储 + Adam 优化器状态，占用约 `1.8 GB` 显存。
-  - 训练 Batch 数据占用极小 (Batch=4096，1536 维，FP32) < 100 MB。
-  - **总显存需求**: `< 4 GB`，极度轻量。
+**当前仓库现状**:
+- 训练侧已经支持多层扫描
+- eval 侧还没有“一条命令直接扫完所有层”的 CLI
+- 所以当前推荐做法是: **逐层跑 `analyze-geometry`，再汇总 `silhouette_score`**
 
-### 3.2 存储与内存 (RAM/Disk)
-- **磁盘占用 (Disk)**: 当前只保存 step delimiter activation，而不是整段 token activation。对 500 条数学题，通常只会留下几千到几万条 step-level 向量；按 1536 维 bf16 粗估，落盘体积通常在 **`数十 MB 到数百 MB`** 量级，明显低于之前的 token-span 方案。
-- **系统内存 (RAM)**: 内存洗牌队列 (Buffer) 配置为 `500 MB`，加上数据加载进程的开销，系统内存需求仅需 `< 8 GB`。
+### Step 4.1: 逐层跑 geometry
+
+前提:
+- 你已经完成 `Phase 1B`
+- 你已经完成 `Phase 2B`
+- `./checkpoints/math500-layer-scan/scan_manifest.json` 已经存在
+
+```bash
+for layer in 0 4 8 12 16 20 24 27; do
+  python -m agora_sae.scripts.evaluate_paper_math500 analyze-geometry \
+      --labels ./eval/math500_step_labels.jsonl \
+      --checkpoint ./checkpoints/math500-layer-scan/layer_${layer}/checkpoint_final.pt \
+      --model <LOCAL_MODEL_PATH> \
+      --layer ${layer} \
+      --output-dir ./eval/layer_scan/layer_${layer} \
+      --embedding-method pca
+done
+```
+
+这里推荐先用 `pca`，因为:
+- layer-wise 扫描的核心是比较 `silhouette_score`
+- `pca` 更轻，排查环境问题也更简单
+- 等你确认主要趋势后，再把重点层切回 `umap`
+
+### Step 4.2: 汇总各层 silhouette 分数
+
+当前可以直接用一个标准库 Python 脚本做最小汇总:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+base = Path("./eval/layer_scan")
+rows = []
+for path in sorted(base.glob("layer_*/geometry_summary.json")):
+    layer = int(path.parent.name.split("_")[-1])
+    data = json.loads(path.read_text())
+    rows.append((layer, data.get("silhouette_score")))
+
+print("layer\tsilhouette_score")
+for layer, score in rows:
+    print(f"{layer}\t{score}")
+PY
+```
+
+这一步的目标是回答:
+- later layers 是否比 earlier layers 更容易把 `reflection / backtracking / other` 区分开
+- `final layer` 是否仍然是主实验层的合理选择
+
+**推荐解释方式**:
+- 如果 `final layer` 的 silhouette 已经接近最高，后续主结果继续以 `final layer` 为中心
+- 如果某个更早层更高，也建议把它记录为补充观察，而不是直接替换 `final layer` 主线
 
 ---
 
-## 4. 预期结果 (Acceptance Criteria)
+## 9. 最终推荐的运行顺序
 
-1. **成功产出 MATH500 激活文件**: 在 `./data/math500_activations` 目录上生成有效的 `.safetensors` 分片，且分片内的激活对应于 reasoning step delimiter 的 token 位置，而不是整段 token span。
-2. **训练收敛**: Wandb 监控可见 `L2 Reconstruct Error` 平稳下降至预期水平（L2 Ratio $< 5\%$），且由于 $k=32$，L0 激活特征严格固定在 `32`。
-3. **行为标注可落地**: 至少完成 `reflection / backtracking / other` 的逐 step 标注，并能回溯到对应激活点。
-4. **Decoder Geometry 可解释**: final layer 上，`reflection` 与 `backtracking` 对应的高分 decoder columns 在 UMAP 空间中应表现出可见结构，而不是完全混杂。
-5. **因果干预有效**: 对 behavior vector 做 `negative / vanilla / positive` 干预后，相关行为步数应当按预期变化。
-6. **答案尽量保持稳定**: 干预主要改变 reasoning style，而不是简单破坏求解能力；至少在一组代表性数学题上，最终答案应尽量保持一致或只出现轻微波动。
+如果你现在就是要一步步跑到“论文复现第一阶段”的目标，推荐严格按下面顺序执行:
+
+1. `Phase 0`: 采样 `MATH500`
+2. `Phase 1A`: 生成 `layer_27` activations
+3. `Phase 2A`: 训练 `layer_27 SAE`
+4. `Step 3.1`: 做 step label
+5. `Step 3.2`: 做 final-layer geometry
+6. `Step 3.3`: 做 final-layer intervention
+
+如果上面都跑通，再继续:
+
+7. `Phase 1B`: 生成多层 activations
+8. `Phase 2B`: 训练多层 SAE
+9. `Step 4.1`: 逐层 geometry
+10. `Step 4.2`: 汇总 silhouette 分数
+
+这样做的好处是:
+- 先拿到论文主线最关键的 final-layer 结果
+- 再补 layer-wise 分析
+- 不会把“主线复现”和“扫描扩展”混在一起，导致阶段之间互相卡住
+
+---
+
+## 10. 资源预估
+
+### 10.1 final-layer 主线
+
+- **Activation generation**:
+  - 1.5B 模型 bf16 推理大致需要 `~12GB` 量级显存
+  - `batch-size=16` 通常是较稳妥的起点
+- **SAE training**:
+  - 当前 `Top-K SAE` 训练显存压力较小，通常 `<4GB`
+- **Disk**:
+  - step-delimiter activation 只保存 step-level 向量
+  - `500` 条数学题通常只落到 `数十 MB 到数百 MB`
+
+### 10.2 layer-wise 扫描
+
+- Activation generation 和 SAE training 的总耗时，会近似按层数线性放大
+- 如果扫描 `0,4,8,12,16,20,24,27` 这 `8` 层，整体成本大约是 final-layer 单层实验的 `8x`
+- 所以推荐先跑通 `final layer` 主线，再决定是否补全多层扫描
+
+---
+
+## 11. 最低验收标准
+
+### 11.1 主线验收
+
+1. `./data/math500_activations/layer_27` 成功生成 activation shards
+2. `./checkpoints/math500-final-layer/checkpoint_final.pt` 成功产出
+3. `./eval/math500_step_labels.jsonl` 成功产出
+4. `./eval/geometry_math500_final/geometry_summary.json` 成功产出
+5. `./eval/intervention_reflection.jsonl` 成功产出
+
+### 11.2 结果验收
+
+1. Geometry 结果里 `reflection` 和 `backtracking` 的 decoder columns 不是完全混杂
+2. `silhouette_score` 是可计算的，不是空值
+3. `intervention` 后相关行为步数能够随条件变化
+4. 最终答案不会在所有样本上全面崩坏
+
+### 11.3 layer-wise 扫描验收
+
+1. 多层 checkpoint 目录和 `scan_manifest.json` 成功产出
+2. 每个扫描层都能得到一个 `geometry_summary.json`
+3. 能汇总出一张 `layer -> silhouette_score` 对照表
+
+---
+
+## 12. 当前脚本的定位
+
+- 论文主线 eval 请使用 [evaluate_paper_math500.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_paper_math500.py)
+- 通用诊断脚本 [evaluate_sae.py](/Users/siyuantao/repos/Agora-SAE/agora_sae/scripts/evaluate_sae.py) 可以保留，但不要再把它当成 `MATH500` 论文复现主路径
+
+如果后续你要继续往“更严格的 faithful reproduction”推进，下一步最重要的工作不是再补文档，而是把训练侧从 `Top-K SAE` 切到论文中的**标准 SAE**。
