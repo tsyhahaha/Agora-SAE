@@ -29,10 +29,12 @@ class DataConfig:
     reasoning_ratio: float = 0.8  # 80% reasoning, 20% general
     max_seq_length: int = 2048
     question_sample_prob: float = 0.1  # Probability to keep pure question parts
-    
-    # New configurations for sentence-level extraction
-    extraction_split_token: Optional[str] = None  # e.g., "\n\n"
-    retain_query: bool = True  # Keep full prompt context?
+
+    # Reasoning-step extraction configuration
+    step_delimiter: Optional[str] = "\n\n"
+    activation_point_strategy: str = "step_delimiter"
+    retain_query: bool = True  # Keep full prompt context
+    repeat_dataset: bool = False  # Re-loop finite datasets after exhaustion?
 
 
 @dataclass
@@ -131,8 +133,10 @@ PRESETS = {
             reasoning_datasets=["MATH500"],  # Will be mapped specifically
             general_datasets=[],  # 100% reasoning for this math test
             reasoning_ratio=1.0,
-            extraction_split_token="\n\n",
-            retain_query=True
+            step_delimiter="\n\n",
+            activation_point_strategy="step_delimiter",
+            retain_query=True,
+            repeat_dataset=False,
         ),
         sae=SAEConfig(expansion_factor=32, k=32)
     )

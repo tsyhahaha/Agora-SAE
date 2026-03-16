@@ -69,7 +69,8 @@ python -m agora_sae.scripts.evaluate_sae \
 
 说明：
 - `generate_activations` 现在支持 Hugging Face dataset 名称和本地 dataset 路径两种输入。
-- `math500-1.5b` preset 会保留完整 query 作为上下文输入，并只对推理/solution 片段生成 extraction mask。
+- `math500-1.5b` preset 会保留完整 query 作为上下文输入，并只在 reasoning step 的分隔点上提取激活。
+- 对有限本地数据集，`generate_activations` 默认单轮跑完后自动结束；只有显式加 `--repeat-data` 才会循环重跑。
 - 如果 `--batch-size 16` 显存还有余量，可以再提高到 `32`。
 - 如果你把项目安装成包，也可以直接使用 `agora-sample-dataset`、`agora-generate`、`agora-train`、`agora-eval`。
 

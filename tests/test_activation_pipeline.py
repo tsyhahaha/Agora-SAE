@@ -6,6 +6,7 @@ import torch
 
 from agora_sae.config import get_config
 from agora_sae.data.mixed_source import MixedTokenSource
+from agora_sae.data.reasoning_steps import ActivationPointSelector, DelimiterStepSegmenter
 from agora_sae.scripts.generate_activations import build_config_from_args
 from agora_sae.trainer.shard_loader import ShardLoader
 
@@ -48,6 +49,7 @@ def make_args(tmp_path: Path, **overrides) -> Namespace:
         batch_size=64,
         max_batches=None,
         max_seq_length=None,
+        repeat_data=False,
         preset=None,
     )
     for key, value in overrides.items():
@@ -67,6 +69,7 @@ def test_build_config_from_args_applies_cli_overrides_to_preset(tmp_path):
         shard_size_mb=64,
         max_disk_gb=12,
         max_seq_length=1024,
+        repeat_data=True,
     )
 
     config = build_config_from_args(args)
@@ -78,10 +81,38 @@ def test_build_config_from_args_applies_cli_overrides_to_preset(tmp_path):
     assert config.storage.shard_size_mb == 64
     assert config.storage.max_disk_usage_gb == 12
     assert config.data.max_seq_length == 1024
+    assert config.data.repeat_dataset is True
 
     fresh_config = get_config("math500-1.5b")
     assert fresh_config.model.model_name == "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B"
     assert fresh_config.data.reasoning_datasets == ["MATH500"]
+    assert fresh_config.data.repeat_dataset is False
+
+
+def test_delimiter_step_segmenter_preserves_steps_and_boundaries():
+    text = "First compute the sum.\n\nThen conclude the answer is 2."
+    segmenter = DelimiterStepSegmenter("\n\n")
+
+    steps = segmenter.segment(text, (0, len(text)))
+
+    assert len(steps) == 2
+    assert text[steps[0].text_span[0]:steps[0].text_span[1]] == "First compute the sum."
+    assert text[steps[0].delimiter_span[0]:steps[0].delimiter_span[1]] == "\n\n"
+    assert text[steps[1].text_span[0]:steps[1].text_span[1]] == "Then conclude the answer is 2."
+    assert steps[1].delimiter_span is None
+
+
+def test_activation_point_selector_uses_delimiter_then_last_step_token():
+    text = "First compute the sum.\n\nThen conclude the answer is 2."
+    offsets = torch.tensor([(idx, idx + 1) for idx in range(len(text))], dtype=torch.long)
+    segmenter = DelimiterStepSegmenter("\n\n")
+    selector = ActivationPointSelector("step_delimiter")
+
+    mask = selector.select_mask(offsets, segmenter.segment(text, (0, len(text))))
+
+    assert mask.sum().item() == 2
+    assert mask[23].item() is True  # last newline in the delimiter span
+    assert mask[len(text) - 1].item() is True  # final token fallback for the last step
 
 
 def test_parse_reasoning_supports_problem_solution_schema():
@@ -90,7 +121,7 @@ def test_parse_reasoning_supports_problem_solution_schema():
         general_datasets=[],
         tokenizer=DummyTokenizer(),
         reasoning_ratio=1.0,
-        extraction_split_token="\n\n",
+        step_delimiter="\n\n",
         retain_query=True,
     )
 
@@ -103,14 +134,13 @@ def test_parse_reasoning_supports_problem_solution_schema():
 
     assert text_data is not None
     assert text_data["text"].startswith("Problem:\nWhat is 1 + 1?")
-    extracted_segments = [text_data["text"][start:end] for start, end in text_data["target_spans"]]
-    assert extracted_segments == [
-        "First compute the sum.",
-        "Then conclude the answer is 2.",
-    ]
+    assert len(text_data["steps"]) == 2
+
+    token_data = source._tokenize(text_data)
+    assert token_data["activation_mask"].sum().item() == 2
 
 
-def test_reasoning_only_iteration_does_not_touch_general_loader(monkeypatch):
+def test_reasoning_only_iteration_is_single_pass_by_default(monkeypatch):
     source = MixedTokenSource(
         reasoning_datasets=["dummy"],
         general_datasets=[],
@@ -138,10 +168,11 @@ def test_reasoning_only_iteration_does_not_touch_general_loader(monkeypatch):
 
     monkeypatch.setattr(source, "_load_general_datasets", fail_general_loader)
 
-    token_data = next(iter(source))
+    samples = list(iter(source))
 
-    assert token_data["input_ids"].shape[0] >= 10
-    assert token_data["extraction_mask"].any().item() is True
+    assert len(samples) == 1
+    assert samples[0]["input_ids"].shape[0] >= 10
+    assert samples[0]["activation_mask"].any().item() is True
 
 
 def test_shard_loader_reuses_prefetched_results_for_out_of_order_completion(tmp_path):

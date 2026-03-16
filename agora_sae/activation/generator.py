@@ -232,7 +232,7 @@ class OfflineActivationGenerator:
             self.load_model()
 
         batch_count = 0
-        total_tokens = 0
+        total_points = 0
 
         pbar = tqdm(dataloader, desc="Generating activations")
 
@@ -260,10 +260,13 @@ class OfflineActivationGenerator:
 
                 if self._captured_activations is not None:
                     target_device = self._captured_activations.device
-                    extraction_mask = batch.get("extraction_mask", None)
-                    if extraction_mask is not None:
-                        extraction_mask = extraction_mask.to(target_device).bool()
-                        valid_activations = self._captured_activations[extraction_mask]
+                    activation_mask = batch.get("activation_mask", None)
+                    if activation_mask is None:
+                        activation_mask = batch.get("extraction_mask", None)
+
+                    if activation_mask is not None:
+                        activation_mask = activation_mask.to(target_device).bool()
+                        valid_activations = self._captured_activations[activation_mask]
                     elif attention_mask is not None:
                         mask = attention_mask.to(target_device).bool()
                         valid_activations = self._captured_activations[mask]
@@ -272,22 +275,25 @@ class OfflineActivationGenerator:
 
                     if valid_activations.numel() > 0:
                         self.buffer.add(valid_activations)
-                        total_tokens += valid_activations.shape[0]
+                        total_points += valid_activations.shape[0]
 
                 batch_count += 1
                 pbar.set_postfix({
-                    "tokens": f"{total_tokens/1e6:.1f}M",
+                    "points": f"{total_points/1e6:.1f}M",
                     "shards": self.buffer.shard_counter
                 })
 
                 if progress_callback:
-                    progress_callback(batch_count, total_tokens)
+                    progress_callback(batch_count, total_points)
 
                 if max_batches and batch_count >= max_batches:
                     break
 
         self.buffer.finalize()
-        print(f"Generation complete. Total tokens: {total_tokens/1e6:.1f}M, Shards: {self.buffer.shard_counter}")
+        print(
+            f"Generation complete. Total activation points: {total_points/1e6:.1f}M, "
+            f"Shards: {self.buffer.shard_counter}"
+        )
 
     def cleanup(self):
         """Clean up resources."""

@@ -101,13 +101,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-batches",
         type=int,
         default=None,
-        help="Maximum number of batches (None for unlimited)",
+        help="Maximum number of batches (default: run until dataset exhaustion)",
     )
     parser.add_argument(
         "--max-seq-length",
         type=int,
         default=None,
         help="Maximum sequence length",
+    )
+    parser.add_argument(
+        "--repeat-data",
+        action="store_true",
+        help="Loop finite datasets after exhaustion",
     )
 
     # Preset argument
@@ -141,6 +146,8 @@ def build_config_from_args(args: argparse.Namespace) -> Config:
         config.data.reasoning_ratio = args.reasoning_ratio
     if args.max_seq_length is not None:
         config.data.max_seq_length = args.max_seq_length
+    if args.repeat_data:
+        config.data.repeat_dataset = True
 
     if args.output is not None:
         config.storage.storage_path = Path(args.output)
@@ -168,6 +175,9 @@ def main():
     print(f"Hook Layer: {config.model.hook_layer}")
     print(f"d_model: {config.model.d_model}")
     print(f"Reasoning Ratio: {config.data.reasoning_ratio}")
+    print(f"Step Delimiter: {repr(config.data.step_delimiter)}")
+    print(f"Activation Points: {config.data.activation_point_strategy}")
+    print(f"Repeat Dataset: {config.data.repeat_dataset}")
     print(f"Output: {config.storage.storage_path}")
     print(f"Buffer Size: {config.storage.buffer_size_mb} MB")
     print(f"Shard Size: {config.storage.shard_size_mb} MB")

@@ -18,10 +18,10 @@
 ### 1.2 数据采样与处理逻辑 (Data Ingestion)
 - **MATH500 抽样**:
   - 从全量 MATH 数据集中，设置固定的 Random Seed，**随机抽取 500 条数据**作为本次实验的子集（`MATH500`）。
-- **细粒度切割 (Sentence-level Split for Extraction)**:
-  - 针对这 500 条数据，**必须保留完整的 Query, `<think>` (CoT) 及最终 Solution 作为模型的上下文输入**，不能破坏模型推理状态。
-  - **核心逻辑**：在**提取目标层激活值**时，重点关注 `<think>` 和最终 `Solution` 部分，将其**严格以 `\n\n` 为界限划分为逻辑分段**，并仅提取/保存各分段内部的激活向量。
-  - **解释**：这种提取策略（保留全加上下文，但分割提取范围）有效迫使 SAE 将关注点缩窄至特定的单步逻辑操作上（如“展开多项式”、“计算判别式”），避免因提取超长连续片段带来的特征混淆，以捕捉更高质量、更具解释性的微观特征。
+- **Step 级切割与激活取点**:
+  - 针对这 500 条数据，**保留完整的 Query 与最终 reasoning / Solution 作为模型上下文输入**，不破坏原始推理上下文。
+  - **核心逻辑**：先把 reasoning 部分按 `\n\n` 切成 step，再只在每个 step 的 delimiter 位置提取目标层激活；若最后一个 step 后没有显式 delimiter，则回退到该 step 的末 token，确保每条样本至少贡献一个 step-level activation point。
+  - **解释**：这样做把“怎么切 step”和“在哪个点取 activation”拆开了，后续可以换成别的规则甚至 LLM judge，而不需要重写激活生成主流程。
 
 ### 1.3 SAE 架构与超参数 (Top-K SAE)
 基于 `1.5B` 模型的参数量规模与内存规划：
@@ -60,7 +60,7 @@ python -m agora_sae.scripts.sample_dataset \
 
 ### Phase 1: 离线激活值生成 (Activation Generation)
 
-从目标大模型中提取特定层的激活向量。`math500-1.5b` preset 会保留完整 Query 作为上下文输入，并按 `\n\n` 对推理/解答部分生成 extraction mask。
+从目标大模型中提取特定层的激活向量。`math500-1.5b` preset 会保留完整 Query 作为上下文输入，并按 `\n\n` 划分 reasoning step，只保存每个 step 的 delimiter activation。
 
 **执行命令**:
 ```bash
@@ -81,8 +81,9 @@ python -m agora_sae.scripts.generate_activations \
 - `--batch-size 16`: 推荐先从 16 开始；如果显存足够，可以提高到 32。
 - `--buffer-size-mb 500`: 在把特征写入磁盘之前，会在内存里积攒并打乱（Shuffle）特征；这个设置决定了用于打乱的缓冲区大小（单位：MB）。设置得越大，训练数据随机性越好，但内存占用也更高。
 - `--shard-size-mb 100`: 保存到硬盘上的每个特征数据小切片（Shard）的最大体积限制（单位：MB）。
+- `--max-batches`: 可选，只用于 smoke test；默认会在本地有限数据集遍历完一轮后自动停止，不会无限循环。
 
-- **数据流向**: `MixedTokenSource` 会加载本地数据集，保留完整 Query 上下文，并仅对解题/solution 片段按 `\n\n` 分段生成 `extraction_mask`。然后注入 `OfflineActivationGenerator`，前向传播捕获第 12 层输入侧 residual stream 的激活张量。
+- **数据流向**: `MixedTokenSource` 会加载本地数据集，保留完整 Query 上下文，先对 reasoning 片段做 step 切分，再用 activation point selector 只标记各个 step delimiter 对应的 token 位置。然后注入 `OfflineActivationGenerator`，前向传播捕获第 12 层输入侧 residual stream 的激活张量。
 - **落地文件**: 生成的内容会被保存在 `./data/math500_activations` 下的多个紧凑的 `.safetensors` 分片文件中。
 
 ### Phase 2: 高吞吐训练 (Offline SAE Training)
@@ -169,13 +170,13 @@ python -m agora_sae.scripts.evaluate_sae \
   - **总显存需求**: `< 4 GB`，极度轻量。
 
 ### 3.2 存储与内存 (RAM/Disk)
-- **磁盘占用 (Disk)**: 500 条数学题（平均 1000-2000 tokens），总计约 `1e6` tokens。每个 Token 的激活向量 (1536维 * 2 Bytes = 3 KB)。预计生成激活总文件大小在 **`3 GB`以内**。磁盘空间压力很小。
+- **磁盘占用 (Disk)**: 当前只保存 step delimiter activation，而不是整段 token activation。对 500 条数学题，通常只会留下几千到几万条 step-level 向量；按 1536 维 bf16 粗估，落盘体积通常在 **`数十 MB 到数百 MB`** 量级，明显低于之前的 token-span 方案。
 - **系统内存 (RAM)**: 内存洗牌队列 (Buffer) 配置为 `500 MB`，加上数据加载进程的开销，系统内存需求仅需 `< 8 GB`。
 
 ---
 
 ## 4. 预期结果 (Acceptance Criteria)
 
-1. **成功产出 MATH500 激活文件**: 在 `./data/math500_activations` 目录上生成有效的 `.safetensors` 分片，且由于使用了 `math500-1.5b` 预设，分片内的激活对应于按照 `\n\n` 细粒度逻辑切断后的文本片段。
+1. **成功产出 MATH500 激活文件**: 在 `./data/math500_activations` 目录上生成有效的 `.safetensors` 分片，且分片内的激活对应于 reasoning step delimiter 的 token 位置，而不是整段 token span。
 2. **训练收敛**: Wandb 监控可见 `L2 Reconstruct Error` 平稳下降至预期水平（L2 Ratio $< 5\%$），且由于 $k=32$，L0 激活特征严格固定在 `32`。
 3. **低死神经元率 (Dead Latents)**: 通过设置 `Aux Loss Weight`=`1/32`，确保在 MATH500 特定领域的子集内，特征死亡率处于极低水平 (`< 1%`)。
