@@ -35,6 +35,7 @@ FINAL_ANSWER_PATTERN = re.compile(
     r"(?:Final Answer|Answer)\s*[:：]\s*(.+)",
     re.IGNORECASE | re.DOTALL,
 )
+JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
 @dataclass
@@ -244,12 +245,157 @@ class OpenAIJudge(StepJudge):
         return parsed
 
 
-def get_step_judge(judge: str, judge_model: str = "gpt-5") -> StepJudge:
+class MinimaxJudge(StepJudge):
+    """LLM-as-a-judge classifier using the MiniMax OpenAI-compatible API."""
+
+    DEFAULT_BASE_URL = "https://api.minimax.io/v1"
+
+    def __init__(
+        self,
+        model: str = "MiniMax-M2.5",
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        timeout: int = 60,
+        max_retries: int = 3,
+    ):
+        self.model = model
+        self.api_key = api_key or os.environ.get("MINIMAX_API_KEY")
+        self.base_url = (base_url or os.environ.get("MINIMAX_BASE_URL") or self.DEFAULT_BASE_URL).rstrip("/")
+        self.timeout = timeout
+        self.max_retries = max_retries
+        if not self.api_key:
+            raise ValueError("MINIMAX_API_KEY is required for the MiniMax judge.")
+
+    def classify_step(
+        self,
+        question: str,
+        response: str,
+        step_text: str,
+        previous_step: Optional[str] = None,
+        next_step: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        system_prompt = (
+            "You are labeling a reasoning step from a math solution. "
+            "Use exactly one label: reflection, backtracking, or other. "
+            "Reflection means re-checking or re-examining earlier reasoning. "
+            "Backtracking means abandoning the current line of reasoning and switching to a new one. "
+            "Other means the step is neither reflection nor backtracking. "
+            "Return only valid JSON with keys label and rationale."
+        )
+        user_prompt = (
+            f"Question:\n{question}\n\n"
+            f"Full response:\n{response}\n\n"
+            f"Previous step:\n{previous_step or '<none>'}\n\n"
+            f"Current step:\n{step_text}\n\n"
+            f"Next step:\n{next_step or '<none>'}\n\n"
+            "Return JSON with keys label and rationale."
+        )
+        payload = {
+            "model": self.model,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_prompt},
+            ],
+            # MiniMax documents this as the raw request-body field used by the
+            # OpenAI-compatible API to move thinking content out of message.content.
+            "reasoning_split": True,
+        }
+
+        for attempt in range(self.max_retries):
+            try:
+                response_json = self._request(payload)
+                parsed = self._parse_response_json(response_json)
+                return parsed["label"], parsed.get("rationale")
+            except Exception:
+                if attempt + 1 >= self.max_retries:
+                    raise
+                time.sleep(2 ** attempt)
+
+        raise RuntimeError("MiniMax judge exhausted retries unexpectedly.")
+
+    def _request(self, payload: Dict) -> Dict:
+        request = urllib.request.Request(
+            f"{self.base_url}/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {self.api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"MiniMax API request failed ({exc.code}): {body}") from exc
+
+    @classmethod
+    def _parse_response_json(cls, response_json: Dict) -> Dict[str, str]:
+        choices = response_json.get("choices") or []
+        if not choices:
+            raise ValueError("MiniMax response did not contain any choices.")
+
+        message = choices[0].get("message") or {}
+        raw_text = cls._extract_message_text(message.get("content"))
+        if not raw_text:
+            raise ValueError("MiniMax response did not contain message content.")
+
+        return cls._parse_label_payload(raw_text)
+
+    @staticmethod
+    def _extract_message_text(content) -> Optional[str]:
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts = []
+            for item in content:
+                if isinstance(item, str) and item.strip():
+                    parts.append(item.strip())
+                elif isinstance(item, dict):
+                    text = item.get("text") or item.get("value") or item.get("content")
+                    if isinstance(text, str) and text.strip():
+                        parts.append(text.strip())
+            return "\n".join(parts).strip() or None
+        return None
+
+    @staticmethod
+    def _parse_label_payload(raw_text: str) -> Dict[str, str]:
+        candidates = [raw_text.strip()]
+
+        fenced_match = JSON_BLOCK_PATTERN.search(raw_text)
+        if fenced_match:
+            candidates.append(fenced_match.group(1).strip())
+
+        start_index = raw_text.find("{")
+        end_index = raw_text.rfind("}")
+        if start_index != -1 and end_index != -1 and end_index > start_index:
+            candidates.append(raw_text[start_index : end_index + 1].strip())
+
+        for candidate in candidates:
+            try:
+                parsed = json.loads(candidate)
+            except json.JSONDecodeError:
+                continue
+            label = parsed.get("label")
+            if label not in {"reflection", "backtracking", "other"}:
+                continue
+            rationale = parsed.get("rationale")
+            if rationale is not None:
+                rationale = str(rationale)
+            return {"label": label, "rationale": rationale}
+
+        raise ValueError(f"Could not parse MiniMax judge response as label JSON: {raw_text}")
+
+
+def get_step_judge(judge: str, judge_model: Optional[str] = None) -> StepJudge:
     """Build the requested step judge."""
     if judge == "heuristic":
         return HeuristicStepJudge()
     if judge == "openai":
-        return OpenAIJudge(model=judge_model)
+        return OpenAIJudge(model=judge_model or "gpt-5")
+    if judge == "minimax":
+        return MinimaxJudge(model=judge_model or "MiniMax-M2.5")
     raise ValueError(f"Unsupported judge: {judge}")
 
 

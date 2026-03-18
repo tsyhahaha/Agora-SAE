@@ -49,8 +49,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Prompt template used when --response-source=model",
     )
     label_parser.add_argument("--delimiter", default="\n\n", help="Step delimiter")
-    label_parser.add_argument("--judge", choices=["openai", "heuristic"], default="heuristic")
-    label_parser.add_argument("--judge-model", default="gpt-5", help="Judge model for --judge=openai")
+    label_parser.add_argument("--judge", choices=["openai", "minimax", "heuristic"], default="heuristic")
+    label_parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Judge model for external judges. Defaults: gpt-5 for OpenAI, MiniMax-M2.5 for MiniMax.",
+    )
     label_parser.add_argument("--max-samples", type=int, default=500)
     label_parser.add_argument("--max-new-tokens", type=int, default=512)
     label_parser.add_argument("--temperature", type=float, default=0.0)
@@ -90,11 +94,15 @@ def build_parser() -> argparse.ArgumentParser:
     intervention_parser.add_argument("--delimiter", default="\n\n", help="Step delimiter")
     intervention_parser.add_argument(
         "--judge",
-        choices=["openai", "heuristic"],
+        choices=["openai", "minimax", "heuristic"],
         default="heuristic",
         help="Judge used to count generated behaviors",
     )
-    intervention_parser.add_argument("--judge-model", default="gpt-5")
+    intervention_parser.add_argument(
+        "--judge-model",
+        default=None,
+        help="Judge model for external judges. Defaults: gpt-5 for OpenAI, MiniMax-M2.5 for MiniMax.",
+    )
     intervention_parser.add_argument("--max-samples", type=int, default=32)
     intervention_parser.add_argument("--top-features", type=int, default=8)
     intervention_parser.add_argument(
@@ -130,7 +138,7 @@ def run_label_steps(args: argparse.Namespace):
         judge=judge,
         output_path=Path(args.output),
         judge_name=args.judge,
-        judge_model=args.judge_model if args.judge == "openai" else None,
+        judge_model=getattr(judge, "model", None) if args.judge in {"openai", "minimax"} else None,
     )
     print(f"Labeled {n_records} reasoning steps across {len(samples)} samples.")
     print(f"Saved labels to: {args.output}")

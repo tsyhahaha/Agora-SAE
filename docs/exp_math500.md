@@ -292,6 +292,24 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
     --max-new-tokens 512
 ```
 
+如果你要改用 MiniMax 做 labeling，可以切到下面这条命令：
+
+```bash
+export MINIMAX_API_KEY=<YOUR_MINIMAX_API_KEY>
+# 中国区可按需覆盖:
+# export MINIMAX_BASE_URL=https://api.minimaxi.com/v1
+
+python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
+    --dataset-path <LOCAL_MATH500_PATH> \
+    --output ./eval/math500_step_labels.jsonl \
+    --response-source model \
+    --model <LOCAL_MODEL_PATH> \
+    --judge minimax \
+    --judge-model MiniMax-M2.5 \
+    --max-samples 500 \
+    --max-new-tokens 512
+```
+
 **产物**:
 - `./eval/math500_step_labels.jsonl`
 
@@ -302,7 +320,7 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
   - `step_text`
   - `label`
 
-如果你只是要先跑通本地流程，可以把 `--judge openai` 改成 `--judge heuristic`，但那不属于论文主线。
+如果你只是要先跑通本地流程，可以把 `--judge openai` 或 `--judge minimax` 改成 `--judge heuristic`，但那不属于论文主线。
 
 ### Step 3.2: 做 final-layer geometry 分析
 
@@ -351,6 +369,12 @@ python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
     --max-samples 32 \
     --max-new-tokens 384
 ```
+
+如果你要用 MiniMax 作为行为计数 judge，把上面命令里的
+`--judge openai --judge-model gpt-5`
+替换成
+`--judge minimax --judge-model MiniMax-M2.5`
+即可。中国区如果需要，也可以先设置 `MINIMAX_BASE_URL=https://api.minimaxi.com/v1`。
 
 如果你要做 `backtracking`，只需要把:
 - `--behavior reflection`
