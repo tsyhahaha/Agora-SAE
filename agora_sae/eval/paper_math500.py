@@ -628,6 +628,12 @@ def create_reasoning_samples(
     dataset_iter = iter(load_dataset_source(dataset_path, split_name="train"))
     samples: List[ReasoningSample] = []
     segmenter = DelimiterStepSegmenter(delimiter)
+    progress_desc = (
+        "Generating model responses"
+        if response_source == "model"
+        else "Preparing reasoning samples"
+    )
+    progress = tqdm(total=max_samples, desc=progress_desc, unit="sample")
 
     tokenizer = None
     model = None
@@ -689,10 +695,12 @@ def create_reasoning_samples(
                     reference_answer=reference_answer,
                 )
             )
+            progress.update(1)
 
             if max_samples is not None and len(samples) >= max_samples:
                 break
     finally:
+        progress.close()
         if model is not None:
             del model
             if torch.cuda.is_available():
@@ -734,46 +742,52 @@ def write_step_labels(
     """Label reasoning steps and write them to JSONL."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
     n_records = 0
+    total_steps = sum(len(sample.steps) for sample in samples)
+    progress = tqdm(total=total_steps, desc=f"Labeling steps ({judge_name})", unit="step")
 
-    with output_path.open("w", encoding="utf-8") as handle:
-        for sample in tqdm(samples, desc="Labeling reasoning steps"):
-            for step_index, step in enumerate(sample.steps):
-                step_text = sample.full_text[sample.steps[step_index].text_span[0] : sample.steps[step_index].text_span[1]]
-                previous_step = None
-                next_step = None
-                if step_index > 0:
-                    previous_span = sample.steps[step_index - 1].text_span
-                    previous_step = sample.full_text[previous_span[0] : previous_span[1]]
-                if step_index + 1 < len(sample.steps):
-                    next_span = sample.steps[step_index + 1].text_span
-                    next_step = sample.full_text[next_span[0] : next_span[1]]
+    try:
+        with output_path.open("w", encoding="utf-8") as handle:
+            for sample in samples:
+                for step_index, step in enumerate(sample.steps):
+                    step_text = sample.full_text[sample.steps[step_index].text_span[0] : sample.steps[step_index].text_span[1]]
+                    previous_step = None
+                    next_step = None
+                    if step_index > 0:
+                        previous_span = sample.steps[step_index - 1].text_span
+                        previous_step = sample.full_text[previous_span[0] : previous_span[1]]
+                    if step_index + 1 < len(sample.steps):
+                        next_span = sample.steps[step_index + 1].text_span
+                        next_step = sample.full_text[next_span[0] : next_span[1]]
 
-                label, rationale = judge.classify_step(
-                    question=sample.question,
-                    response=sample.response,
-                    step_text=step_text,
-                    previous_step=previous_step,
-                    next_step=next_step,
-                )
-                record = {
-                    "sample_id": sample.sample_id,
-                    "question": sample.question,
-                    "response": sample.response,
-                    "full_text": sample.full_text,
-                    "reference_answer": sample.reference_answer,
-                    "step_id": step_index,
-                    "step_text": step_text,
-                    "step_start_char": step.text_span[0],
-                    "step_end_char": step.text_span[1],
-                    "delimiter_start_char": step.delimiter_span[0] if step.delimiter_span else None,
-                    "delimiter_end_char": step.delimiter_span[1] if step.delimiter_span else None,
-                    "label": label,
-                    "label_rationale": rationale,
-                    "label_source": judge_name,
-                    "judge_model": judge_model,
-                }
-                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                n_records += 1
+                    label, rationale = judge.classify_step(
+                        question=sample.question,
+                        response=sample.response,
+                        step_text=step_text,
+                        previous_step=previous_step,
+                        next_step=next_step,
+                    )
+                    record = {
+                        "sample_id": sample.sample_id,
+                        "question": sample.question,
+                        "response": sample.response,
+                        "full_text": sample.full_text,
+                        "reference_answer": sample.reference_answer,
+                        "step_id": step_index,
+                        "step_text": step_text,
+                        "step_start_char": step.text_span[0],
+                        "step_end_char": step.text_span[1],
+                        "delimiter_start_char": step.delimiter_span[0] if step.delimiter_span else None,
+                        "delimiter_end_char": step.delimiter_span[1] if step.delimiter_span else None,
+                        "label": label,
+                        "label_rationale": rationale,
+                        "label_source": judge_name,
+                        "judge_model": judge_model,
+                    }
+                    handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    n_records += 1
+                    progress.update(1)
+    finally:
+        progress.close()
 
     return n_records
 

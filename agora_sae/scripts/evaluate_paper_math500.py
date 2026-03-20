@@ -133,6 +133,14 @@ def run_label_steps(args: argparse.Namespace):
         top_p=args.top_p,
         seed=args.seed,
     )
+    print(f"Prepared {len(samples)} reasoning samples.")
+    if args.judge in {"openai", "minimax"}:
+        print(
+            f"Starting external step labeling via {args.judge} "
+            f"(model={getattr(judge, 'model', args.judge_model)})..."
+        )
+    else:
+        print("Starting heuristic step labeling...")
     n_records = write_step_labels(
         samples=samples,
         judge=judge,
