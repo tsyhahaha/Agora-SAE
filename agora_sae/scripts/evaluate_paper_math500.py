@@ -20,6 +20,7 @@ from agora_sae.eval.paper_math500 import (
     write_step_labels,
     compute_silhouette,
 )
+from agora_sae.jsonl_resume import prepare_jsonl_output
 from agora_sae.trainer.sae_trainer import load_sae_from_checkpoint
 
 
@@ -60,6 +61,16 @@ def build_parser() -> argparse.ArgumentParser:
     label_parser.add_argument("--temperature", type=float, default=0.0)
     label_parser.add_argument("--top-p", type=float, default=1.0)
     label_parser.add_argument("--seed", type=int, default=42)
+    label_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing output JSONL and skip already labeled steps",
+    )
+    label_parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="Overwrite an existing output JSONL instead of resuming",
+    )
 
     geometry_parser = subparsers.add_parser(
         "analyze-geometry",
@@ -114,12 +125,30 @@ def build_parser() -> argparse.ArgumentParser:
     intervention_parser.add_argument("--temperature", type=float, default=0.0)
     intervention_parser.add_argument("--top-p", type=float, default=1.0)
     intervention_parser.add_argument("--seed", type=int, default=42)
+    intervention_parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from an existing intervention JSONL and skip completed sample/condition pairs",
+    )
+    intervention_parser.add_argument(
+        "--overwrite-output",
+        action="store_true",
+        help="Overwrite an existing intervention JSONL instead of resuming",
+    )
 
     return parser
 
 
 def run_label_steps(args: argparse.Namespace):
     """Execute the label-steps subcommand."""
+    _, existing_state = prepare_jsonl_output(
+        Path(args.output),
+        key_fields=("sample_id", "step_id"),
+        resume=args.resume,
+        overwrite=args.overwrite_output,
+    )
+    if existing_state.loaded_records:
+        print(f"Found {existing_state.loaded_records} existing labeled steps in {args.output}.")
     judge = get_step_judge(args.judge, judge_model=args.judge_model)
     samples = create_reasoning_samples(
         dataset_path=args.dataset_path,
@@ -141,14 +170,29 @@ def run_label_steps(args: argparse.Namespace):
         )
     else:
         print("Starting heuristic step labeling...")
-    n_records = write_step_labels(
+    label_summary = write_step_labels(
         samples=samples,
         judge=judge,
         output_path=Path(args.output),
         judge_name=args.judge,
         judge_model=getattr(judge, "model", None) if args.judge in {"openai", "minimax"} else None,
+        resume=args.resume,
+        overwrite_output=args.overwrite_output,
     )
-    print(f"Labeled {n_records} reasoning steps across {len(samples)} samples.")
+    if label_summary["recovered_records"]:
+        print(
+            f"Recovered {label_summary['recovered_records']} existing labeled steps "
+            f"from {args.output}."
+        )
+    if label_summary["skipped_invalid_lines"]:
+        print(
+            f"Ignored {label_summary['skipped_invalid_lines']} malformed trailing JSONL line(s) "
+            f"while resuming {args.output}."
+        )
+    print(
+        f"Wrote {label_summary['written_records']} new labeled steps "
+        f"({label_summary['total_records']} total) across {len(samples)} samples."
+    )
     print(f"Saved labels to: {args.output}")
 
 
@@ -188,6 +232,14 @@ def run_analyze_geometry(args: argparse.Namespace):
 
 def run_intervention(args: argparse.Namespace):
     """Execute the run-intervention subcommand."""
+    _, existing_state = prepare_jsonl_output(
+        Path(args.output),
+        key_fields=("sample_id", "condition"),
+        resume=args.resume,
+        overwrite=args.overwrite_output,
+    )
+    if existing_state.loaded_records:
+        print(f"Found {existing_state.loaded_records} existing intervention records in {args.output}.")
     judge = get_step_judge(args.judge, judge_model=args.judge_model)
     summary = load_geometry_summary(Path(args.geometry_summary))
     sae = load_sae_from_checkpoint(Path(args.checkpoint))
@@ -219,6 +271,8 @@ def run_intervention(args: argparse.Namespace):
         top_p=args.top_p,
         output_path=Path(args.output),
         seed=args.seed,
+        resume=args.resume,
+        overwrite_output=args.overwrite_output,
     )
     print(json.dumps(results, indent=2, ensure_ascii=False))
     print(f"Saved intervention runs to: {args.output}")

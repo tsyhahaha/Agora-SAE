@@ -25,6 +25,7 @@ from agora_sae.data.reasoning_steps import (
     DelimiterStepSegmenter,
     ReasoningStep,
 )
+from agora_sae.jsonl_resume import load_jsonl_records, prepare_jsonl_output
 
 
 SOLUTION_HEADER_PATTERN = re.compile(
@@ -738,17 +739,34 @@ def write_step_labels(
     output_path: Path,
     judge_name: str,
     judge_model: Optional[str] = None,
-) -> int:
+    resume: bool = False,
+    overwrite_output: bool = False,
+) -> Dict[str, int]:
     """Label reasoning steps and write them to JSONL."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    n_records = 0
+    file_mode, resume_state = prepare_jsonl_output(
+        output_path,
+        key_fields=("sample_id", "step_id"),
+        resume=resume,
+        overwrite=overwrite_output,
+    )
+    n_written_records = 0
     total_steps = sum(len(sample.steps) for sample in samples)
-    progress = tqdm(total=total_steps, desc=f"Labeling steps ({judge_name})", unit="step")
+    progress = tqdm(
+        total=total_steps,
+        initial=len(resume_state.completed_keys),
+        desc=f"Labeling steps ({judge_name})",
+        unit="step",
+    )
 
     try:
-        with output_path.open("w", encoding="utf-8") as handle:
+        with output_path.open(file_mode, encoding="utf-8") as handle:
             for sample in samples:
                 for step_index, step in enumerate(sample.steps):
+                    step_key = (sample.sample_id, step_index)
+                    if step_key in resume_state.completed_keys:
+                        continue
+
                     step_text = sample.full_text[sample.steps[step_index].text_span[0] : sample.steps[step_index].text_span[1]]
                     previous_step = None
                     next_step = None
@@ -784,12 +802,18 @@ def write_step_labels(
                         "judge_model": judge_model,
                     }
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
-                    n_records += 1
+                    handle.flush()
+                    n_written_records += 1
                     progress.update(1)
     finally:
         progress.close()
 
-    return n_records
+    return {
+        "written_records": n_written_records,
+        "recovered_records": resume_state.loaded_records,
+        "skipped_invalid_lines": resume_state.skipped_invalid_lines,
+        "total_records": len(resume_state.completed_keys) + n_written_records,
+    }
 
 
 def load_step_records(path: Path) -> List[Dict]:
@@ -1315,9 +1339,17 @@ def run_intervention_eval(
     top_p: float,
     output_path: Path,
     seed: int = 42,
+    resume: bool = False,
+    overwrite_output: bool = False,
 ) -> Dict[str, Dict[str, float]]:
     """Run causal interventions and save per-sample results."""
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    file_mode, resume_state = prepare_jsonl_output(
+        output_path,
+        key_fields=("sample_id", "condition"),
+        resume=resume,
+        overwrite=overwrite_output,
+    )
     aggregates = defaultdict(
         lambda: {
             "reflection": 0,
@@ -1342,12 +1374,36 @@ def run_intervention_eval(
     model.eval()
     input_device = get_input_device(model)
     target_layer = get_target_layer(model, hook_layer)
+    recovered_records, _ = load_jsonl_records(output_path) if resume else ([], 0)
+    for record in recovered_records:
+        condition_name = record["condition"]
+        aggregate = aggregates[condition_name]
+        aggregate["reflection"] += record.get("reflection_steps", 0)
+        aggregate["backtracking"] += record.get("backtracking_steps", 0)
+        aggregate["other"] += record.get("other_steps", 0)
+        aggregate["total"] += 1
+        is_correct = record.get("is_correct")
+        if is_correct is not None:
+            aggregate["scored"] += 1
+            if is_correct:
+                aggregate["correct"] += 1
+    progress = tqdm(
+        total=len(samples) * len(conditions),
+        initial=len(resume_state.completed_keys),
+        desc="Running interventions",
+        unit="run",
+    )
 
     try:
-        with output_path.open("w", encoding="utf-8") as handle:
-            for sample in tqdm(samples, desc="Running interventions"):
+        with output_path.open(file_mode, encoding="utf-8") as handle:
+            for sample in samples:
                 prompt = sample.question
                 for condition_name, alpha in conditions:
+                    record_key = (sample.sample_id, condition_name)
+                    if record_key in resume_state.completed_keys:
+                        progress.update(1)
+                        continue
+
                     response = _generate_with_loaded_model(
                         model=model,
                         tokenizer=tokenizer,
@@ -1384,6 +1440,8 @@ def run_intervention_eval(
                         "response": response,
                     }
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    handle.flush()
+                    progress.update(1)
 
                     aggregate = aggregates[condition_name]
                     aggregate["reflection"] += record["reflection_steps"]
@@ -1395,6 +1453,7 @@ def run_intervention_eval(
                         if is_correct:
                             aggregate["correct"] += 1
     finally:
+        progress.close()
         del model
         if torch.cuda.is_available():
             torch.cuda.empty_cache()

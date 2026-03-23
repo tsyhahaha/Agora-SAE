@@ -292,6 +292,23 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
     --max-new-tokens 512
 ```
 
+如果中途因为网络抖动或 judge API 失败中断，直接用同一条命令加上 `--resume` 即可继续，已经写入 `JSONL` 的 step 会被自动跳过：
+
+```bash
+python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
+    --dataset-path <LOCAL_MATH500_PATH> \
+    --output ./eval/math500_step_labels.jsonl \
+    --response-source model \
+    --model <LOCAL_MODEL_PATH> \
+    --judge minimax \
+    --judge-model MiniMax-M2.5 \
+    --max-samples 500 \
+    --max-new-tokens 512 \
+    --resume
+```
+
+如果你明确要丢弃旧结果重新开始，再加 `--overwrite-output`。
+
 如果你要改用 MiniMax 做 labeling，可以切到下面这条命令：
 
 ```bash
@@ -369,6 +386,8 @@ python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
     --max-samples 32 \
     --max-new-tokens 384
 ```
+
+这一步同样支持 `--resume`。如果中途断掉，再次执行相同命令并加 `--resume`，已经完成的 `sample_id + condition` 组合会被跳过，不会从头再跑。
 
 如果你要用 MiniMax 作为行为计数 judge，把上面命令里的
 `--judge openai --judge-model gpt-5`
