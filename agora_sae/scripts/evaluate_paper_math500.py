@@ -20,7 +20,7 @@ from agora_sae.eval.paper_math500 import (
     write_step_labels,
     compute_silhouette,
 )
-from agora_sae.jsonl_resume import prepare_jsonl_output
+from agora_sae.jsonl_resume import load_jsonl_records, prepare_jsonl_output
 from agora_sae.trainer.sae_trainer import load_sae_from_checkpoint
 
 
@@ -37,6 +37,14 @@ def build_parser() -> argparse.ArgumentParser:
     )
     label_parser.add_argument("--dataset-path", required=True, help="Dataset name or local path")
     label_parser.add_argument("--output", required=True, help="Output JSONL for labeled steps")
+    label_parser.add_argument(
+        "--response-cache",
+        default=None,
+        help=(
+            "Optional JSONL cache for model-generated responses. "
+            "Defaults to <output>.responses.jsonl when --response-source=model."
+        ),
+    )
     label_parser.add_argument(
         "--response-source",
         choices=["dataset", "model"],
@@ -139,6 +147,34 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _load_prefetched_responses_from_label_output(output_path: Path) -> dict[str, dict]:
+    """Recover cached sample responses from an existing label JSONL."""
+    records, skipped_invalid_lines = load_jsonl_records(output_path)
+    prefetched = {}
+    for record in records:
+        sample_id = str(record["sample_id"])
+        prefetched.setdefault(
+            sample_id,
+            {
+                "sample_id": sample_id,
+                "question": record.get("question", ""),
+                "response": record.get("response", ""),
+                "reference_answer": record.get("reference_answer"),
+            },
+        )
+    if prefetched:
+        print(
+            f"Recovered model responses for {len(prefetched)} sample(s) "
+            f"from existing label output {output_path}."
+        )
+    if skipped_invalid_lines:
+        print(
+            f"Ignored {skipped_invalid_lines} malformed trailing JSONL line(s) "
+            f"while reading {output_path}."
+        )
+    return prefetched
+
+
 def run_label_steps(args: argparse.Namespace):
     """Execute the label-steps subcommand."""
     _, existing_state = prepare_jsonl_output(
@@ -149,6 +185,16 @@ def run_label_steps(args: argparse.Namespace):
     )
     if existing_state.loaded_records:
         print(f"Found {existing_state.loaded_records} existing labeled steps in {args.output}.")
+    response_cache_path = None
+    prefetched_responses = None
+    if args.response_source == "model":
+        response_cache_path = (
+            Path(args.response_cache)
+            if args.response_cache
+            else Path(args.output).with_suffix(".responses.jsonl")
+        )
+        if args.resume and Path(args.output).exists():
+            prefetched_responses = _load_prefetched_responses_from_label_output(Path(args.output))
     judge = get_step_judge(args.judge, judge_model=args.judge_model)
     samples = create_reasoning_samples(
         dataset_path=args.dataset_path,
@@ -161,6 +207,10 @@ def run_label_steps(args: argparse.Namespace):
         temperature=args.temperature,
         top_p=args.top_p,
         seed=args.seed,
+        response_cache_path=response_cache_path,
+        resume_response_cache=args.resume,
+        overwrite_response_cache=args.overwrite_output,
+        prefetched_responses=prefetched_responses,
     )
     print(f"Prepared {len(samples)} reasoning samples.")
     if args.judge in {"openai", "minimax"}:

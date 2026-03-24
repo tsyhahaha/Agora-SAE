@@ -624,6 +624,10 @@ def create_reasoning_samples(
     temperature: float = 0.0,
     top_p: float = 1.0,
     seed: int = 42,
+    response_cache_path: Optional[Path] = None,
+    resume_response_cache: bool = False,
+    overwrite_response_cache: bool = False,
+    prefetched_responses: Optional[Dict[str, Dict]] = None,
 ) -> List[ReasoningSample]:
     """Load reasoning samples from a dataset, optionally generating fresh responses."""
     dataset_iter = iter(load_dataset_source(dataset_path, split_name="train"))
@@ -639,6 +643,8 @@ def create_reasoning_samples(
     tokenizer = None
     model = None
     input_device = None
+    cached_response_records: Dict[str, Dict] = dict(prefetched_responses or {})
+    cache_handle = None
     if response_source == "model":
         if not model_name:
             raise ValueError("--model is required when --response-source=model")
@@ -655,6 +661,35 @@ def create_reasoning_samples(
         input_device = get_input_device(model)
         if temperature == 0.0:
             torch.manual_seed(seed)
+        if response_cache_path is not None:
+            response_cache_path.parent.mkdir(parents=True, exist_ok=True)
+            file_mode, resume_state = prepare_jsonl_output(
+                response_cache_path,
+                key_fields=("sample_id",),
+                resume=resume_response_cache,
+                overwrite=overwrite_response_cache,
+            )
+            cache_records, skipped_invalid_lines = (
+                load_jsonl_records(response_cache_path)
+                if file_mode == "a"
+                else ([], 0)
+            )
+            for record in cache_records:
+                sample_id = str(record["sample_id"])
+                cached_response_records[sample_id] = record
+            if response_cache_path:
+                print(f"Model response cache: {response_cache_path}")
+            if resume_state.loaded_records:
+                print(
+                    f"Recovered {resume_state.loaded_records} cached model responses "
+                    f"from {response_cache_path}."
+                )
+            if skipped_invalid_lines:
+                print(
+                    f"Ignored {skipped_invalid_lines} malformed trailing JSONL line(s) "
+                    f"while resuming {response_cache_path}."
+                )
+            cache_handle = response_cache_path.open(file_mode, encoding="utf-8")
 
     try:
         for raw_index, example in enumerate(dataset_iter):
@@ -664,18 +699,46 @@ def create_reasoning_samples(
 
             question, response, reference_answer = parsed
             if response_source == "model":
-                if not question:
-                    continue
-                prompt = build_prompt(question, prompt_template)
-                response = generate_model_response(
-                    model=model,
-                    tokenizer=tokenizer,
-                    prompt=prompt,
-                    input_device=input_device,
-                    max_new_tokens=max_new_tokens,
-                    temperature=temperature,
-                    top_p=top_p,
-                )
+                sample_id = str(raw_index)
+                cached_record = cached_response_records.get(sample_id)
+                if cached_record is not None:
+                    cached_question = cached_record.get("question", "")
+                    cached_response = cached_record.get("response", "")
+                    if cached_question and question and cached_question != question:
+                        raise ValueError(
+                            f"Cached response for sample_id={sample_id} does not match the current question."
+                        )
+                    question = cached_question or question
+                    response = cached_response
+                    reference_answer = cached_record.get("reference_answer", reference_answer)
+                else:
+                    if not question:
+                        continue
+                    prompt = build_prompt(question, prompt_template)
+                    response = generate_model_response(
+                        model=model,
+                        tokenizer=tokenizer,
+                        prompt=prompt,
+                        input_device=input_device,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                    )
+                    if cache_handle is not None:
+                        cache_record = {
+                            "sample_id": sample_id,
+                            "question": question,
+                            "response": response,
+                            "reference_answer": reference_answer,
+                            "model_name": model_name,
+                            "prompt_template": prompt_template,
+                            "max_new_tokens": max_new_tokens,
+                            "temperature": temperature,
+                            "top_p": top_p,
+                        }
+                        cache_handle.write(json.dumps(cache_record, ensure_ascii=False) + "\n")
+                        cache_handle.flush()
+                        cached_response_records[sample_id] = cache_record
             elif not response:
                 continue
 
@@ -702,6 +765,8 @@ def create_reasoning_samples(
                 break
     finally:
         progress.close()
+        if cache_handle is not None:
+            cache_handle.close()
         if model is not None:
             del model
             if torch.cuda.is_available():

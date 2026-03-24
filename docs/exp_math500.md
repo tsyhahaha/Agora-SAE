@@ -307,6 +307,13 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
     --resume
 ```
 
+在 `--response-source model` 模式下，脚本现在还会把生成出来的 model response 单独缓存成一个 `JSONL` 文件，默认路径是：
+- `./eval/math500_step_labels.responses.jsonl`
+
+所以再次 `--resume` 时：
+- 已经写进 label 输出的 step 会直接跳过
+- 已经生成过但还没来得及送去 judge 的 response，也会从 response cache 里直接复用，不会重新跑本地模型生成
+
 如果你明确要丢弃旧结果重新开始，再加 `--overwrite-output`。
 
 如果你要改用 MiniMax 做 labeling，可以切到下面这条命令：
