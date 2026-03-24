@@ -64,6 +64,29 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Judge model for external judges. Defaults: gpt-5 for OpenAI, MiniMax-M2.5 for MiniMax.",
     )
+    label_parser.add_argument(
+        "--judge-timeout",
+        type=int,
+        default=60,
+        help="HTTP timeout in seconds for external judge requests.",
+    )
+    label_parser.add_argument(
+        "--judge-max-retries",
+        type=int,
+        default=5,
+        help="Max retry attempts for transient external judge failures.",
+    )
+    label_parser.add_argument(
+        "--minimax-max-output-tokens",
+        type=int,
+        default=128,
+        help="Cap MiniMax judge output tokens to keep label responses short and stable.",
+    )
+    label_parser.add_argument(
+        "--disable-minimax-reasoning-split",
+        action="store_true",
+        help="Disable MiniMax reasoning_split if the compatible endpoint is unstable for long prompts.",
+    )
     label_parser.add_argument("--max-samples", type=int, default=500)
     label_parser.add_argument("--max-new-tokens", type=int, default=512)
     label_parser.add_argument("--temperature", type=float, default=0.0)
@@ -121,6 +144,29 @@ def build_parser() -> argparse.ArgumentParser:
         "--judge-model",
         default=None,
         help="Judge model for external judges. Defaults: gpt-5 for OpenAI, MiniMax-M2.5 for MiniMax.",
+    )
+    intervention_parser.add_argument(
+        "--judge-timeout",
+        type=int,
+        default=60,
+        help="HTTP timeout in seconds for external judge requests.",
+    )
+    intervention_parser.add_argument(
+        "--judge-max-retries",
+        type=int,
+        default=5,
+        help="Max retry attempts for transient external judge failures.",
+    )
+    intervention_parser.add_argument(
+        "--minimax-max-output-tokens",
+        type=int,
+        default=128,
+        help="Cap MiniMax judge output tokens to keep label responses short and stable.",
+    )
+    intervention_parser.add_argument(
+        "--disable-minimax-reasoning-split",
+        action="store_true",
+        help="Disable MiniMax reasoning_split if the compatible endpoint is unstable for long prompts.",
     )
     intervention_parser.add_argument("--max-samples", type=int, default=32)
     intervention_parser.add_argument("--top-features", type=int, default=8)
@@ -195,7 +241,14 @@ def run_label_steps(args: argparse.Namespace):
         )
         if args.resume and Path(args.output).exists():
             prefetched_responses = _load_prefetched_responses_from_label_output(Path(args.output))
-    judge = get_step_judge(args.judge, judge_model=args.judge_model)
+    judge = get_step_judge(
+        args.judge,
+        judge_model=args.judge_model,
+        timeout=args.judge_timeout,
+        max_retries=args.judge_max_retries,
+        minimax_max_output_tokens=args.minimax_max_output_tokens,
+        minimax_reasoning_split=not args.disable_minimax_reasoning_split,
+    )
     samples = create_reasoning_samples(
         dataset_path=args.dataset_path,
         delimiter=args.delimiter,
@@ -290,7 +343,14 @@ def run_intervention(args: argparse.Namespace):
     )
     if existing_state.loaded_records:
         print(f"Found {existing_state.loaded_records} existing intervention records in {args.output}.")
-    judge = get_step_judge(args.judge, judge_model=args.judge_model)
+    judge = get_step_judge(
+        args.judge,
+        judge_model=args.judge_model,
+        timeout=args.judge_timeout,
+        max_retries=args.judge_max_retries,
+        minimax_max_output_tokens=args.minimax_max_output_tokens,
+        minimax_reasoning_split=not args.disable_minimax_reasoning_split,
+    )
     summary = load_geometry_summary(Path(args.geometry_summary))
     sae = load_sae_from_checkpoint(Path(args.checkpoint))
     behavior_vector = build_behavior_vector(

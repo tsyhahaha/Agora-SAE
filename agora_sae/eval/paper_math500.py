@@ -5,9 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import time
-import urllib.error
-import urllib.request
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,6 +22,7 @@ from agora_sae.data.reasoning_steps import (
     DelimiterStepSegmenter,
     ReasoningStep,
 )
+from agora_sae.judge_transport import post_json_with_retry
 from agora_sae.jsonl_resume import load_jsonl_records, prepare_jsonl_output
 
 
@@ -132,7 +130,7 @@ class OpenAIJudge(StepJudge):
         model: str = "gpt-5",
         api_key: Optional[str] = None,
         timeout: int = 60,
-        max_retries: int = 3,
+        max_retries: int = 5,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("OPENAI_API_KEY")
@@ -193,34 +191,22 @@ class OpenAIJudge(StepJudge):
             "max_output_tokens": 200,
         }
 
-        for attempt in range(self.max_retries):
-            try:
-                response_json = self._request(payload)
-                parsed = self._parse_response_json(response_json)
-                return parsed["label"], parsed.get("rationale")
-            except Exception:
-                if attempt + 1 >= self.max_retries:
-                    raise
-                time.sleep(2 ** attempt)
-
-        raise RuntimeError("OpenAI judge exhausted retries unexpectedly.")
+        response_json = self._request(payload)
+        parsed = self._parse_response_json(response_json)
+        return parsed["label"], parsed.get("rationale")
 
     def _request(self, payload: Dict) -> Dict:
-        request = urllib.request.Request(
-            self.API_URL,
-            data=json.dumps(payload).encode("utf-8"),
+        return post_json_with_retry(
+            url=self.API_URL,
+            payload=payload,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            method="POST",
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            provider_name="OpenAI judge",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"OpenAI API request failed ({exc.code}): {body}") from exc
 
     @staticmethod
     def _parse_response_json(response_json: Dict) -> Dict[str, str]:
@@ -250,6 +236,7 @@ class MinimaxJudge(StepJudge):
     """LLM-as-a-judge classifier using the MiniMax OpenAI-compatible API."""
 
     DEFAULT_BASE_URL = "https://api.minimax.io/v1"
+    DEFAULT_MAX_TOKENS = 128
 
     def __init__(
         self,
@@ -257,13 +244,17 @@ class MinimaxJudge(StepJudge):
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: int = 60,
-        max_retries: int = 3,
+        max_retries: int = 5,
+        max_output_tokens: int = DEFAULT_MAX_TOKENS,
+        reasoning_split: bool = True,
     ):
         self.model = model
         self.api_key = api_key or os.environ.get("MINIMAX_API_KEY")
         self.base_url = (base_url or os.environ.get("MINIMAX_BASE_URL") or self.DEFAULT_BASE_URL).rstrip("/")
         self.timeout = timeout
         self.max_retries = max_retries
+        self.max_output_tokens = max_output_tokens
+        self.reasoning_split = reasoning_split
         if not self.api_key:
             raise ValueError("MINIMAX_API_KEY is required for the MiniMax judge.")
 
@@ -297,39 +288,29 @@ class MinimaxJudge(StepJudge):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
             ],
+            "max_tokens": self.max_output_tokens,
+        }
+        if self.reasoning_split:
             # MiniMax documents this as the raw request-body field used by the
             # OpenAI-compatible API to move thinking content out of message.content.
-            "reasoning_split": True,
-        }
+            payload["reasoning_split"] = True
 
-        for attempt in range(self.max_retries):
-            try:
-                response_json = self._request(payload)
-                parsed = self._parse_response_json(response_json)
-                return parsed["label"], parsed.get("rationale")
-            except Exception:
-                if attempt + 1 >= self.max_retries:
-                    raise
-                time.sleep(2 ** attempt)
-
-        raise RuntimeError("MiniMax judge exhausted retries unexpectedly.")
+        response_json = self._request(payload)
+        parsed = self._parse_response_json(response_json)
+        return parsed["label"], parsed.get("rationale")
 
     def _request(self, payload: Dict) -> Dict:
-        request = urllib.request.Request(
-            f"{self.base_url}/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
+        return post_json_with_retry(
+            url=f"{self.base_url}/chat/completions",
+            payload=payload,
             headers={
                 "Authorization": f"Bearer {self.api_key}",
                 "Content-Type": "application/json",
             },
-            method="POST",
+            timeout=self.timeout,
+            max_retries=self.max_retries,
+            provider_name="MiniMax judge",
         )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            body = exc.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"MiniMax API request failed ({exc.code}): {body}") from exc
 
     @classmethod
     def _parse_response_json(cls, response_json: Dict) -> Dict[str, str]:
@@ -389,14 +370,32 @@ class MinimaxJudge(StepJudge):
         raise ValueError(f"Could not parse MiniMax judge response as label JSON: {raw_text}")
 
 
-def get_step_judge(judge: str, judge_model: Optional[str] = None) -> StepJudge:
+def get_step_judge(
+    judge: str,
+    judge_model: Optional[str] = None,
+    *,
+    timeout: int = 60,
+    max_retries: int = 5,
+    minimax_max_output_tokens: int = MinimaxJudge.DEFAULT_MAX_TOKENS,
+    minimax_reasoning_split: bool = True,
+) -> StepJudge:
     """Build the requested step judge."""
     if judge == "heuristic":
         return HeuristicStepJudge()
     if judge == "openai":
-        return OpenAIJudge(model=judge_model or "gpt-5")
+        return OpenAIJudge(
+            model=judge_model or "gpt-5",
+            timeout=timeout,
+            max_retries=max_retries,
+        )
     if judge == "minimax":
-        return MinimaxJudge(model=judge_model or "MiniMax-M2.5")
+        return MinimaxJudge(
+            model=judge_model or "MiniMax-M2.5",
+            timeout=timeout,
+            max_retries=max_retries,
+            max_output_tokens=minimax_max_output_tokens,
+            reasoning_split=minimax_reasoning_split,
+        )
     raise ValueError(f"Unsupported judge: {judge}")
 
 
@@ -842,13 +841,22 @@ def write_step_labels(
                         next_span = sample.steps[step_index + 1].text_span
                         next_step = sample.full_text[next_span[0] : next_span[1]]
 
-                    label, rationale = judge.classify_step(
-                        question=sample.question,
-                        response=sample.response,
-                        step_text=step_text,
-                        previous_step=previous_step,
-                        next_step=next_step,
-                    )
+                    try:
+                        label, rationale = judge.classify_step(
+                            question=sample.question,
+                            response=sample.response,
+                            step_text=step_text,
+                            previous_step=previous_step,
+                            next_step=next_step,
+                        )
+                    except Exception as exc:
+                        raise RuntimeError(
+                            "Judge classification failed for "
+                            f"sample_id={sample.sample_id}, step_id={step_index}, "
+                            f"question_chars={len(sample.question)}, "
+                            f"response_chars={len(sample.response)}, "
+                            f"step_chars={len(step_text)}"
+                        ) from exc
                     record = {
                         "sample_id": sample.sample_id,
                         "question": sample.question,
@@ -1379,13 +1387,20 @@ def label_generated_steps(
             next_span = steps[index + 1].text_span
             next_step = full_text[next_span[0] : next_span[1]]
 
-        label, _ = judge.classify_step(
-            question=question,
-            response=response,
-            step_text=step_text,
-            previous_step=previous_step,
-            next_step=next_step,
-        )
+        try:
+            label, _ = judge.classify_step(
+                question=question,
+                response=response,
+                step_text=step_text,
+                previous_step=previous_step,
+                next_step=next_step,
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "Judge classification failed for generated response "
+                f"step_id={index}, question_chars={len(question)}, "
+                f"response_chars={len(response)}, step_chars={len(step_text)}"
+            ) from exc
         counts[label] += 1
 
     return counts

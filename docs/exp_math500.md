@@ -334,6 +334,27 @@ python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
     --max-new-tokens 512
 ```
 
+外部 judge 现在默认会对 `429`、`5xx` 和瞬时网络错误做带抖动的指数退避重试。如果 MiniMax 线路不稳，可以直接在命令里调：
+- `--judge-max-retries 5`
+- `--judge-timeout 90`
+- `--disable-minimax-reasoning-split`
+
+例如：
+
+```bash
+python -m agora_sae.scripts.evaluate_paper_math500 label-steps \
+    --dataset-path <LOCAL_MATH500_PATH> \
+    --output ./eval/math500_step_labels.jsonl \
+    --response-source model \
+    --model <LOCAL_MODEL_PATH> \
+    --judge minimax \
+    --judge-model MiniMax-M2.5 \
+    --judge-max-retries 5 \
+    --judge-timeout 90 \
+    --disable-minimax-reasoning-split \
+    --resume
+```
+
 **产物**:
 - `./eval/math500_step_labels.jsonl`
 
@@ -400,7 +421,7 @@ python -m agora_sae.scripts.evaluate_paper_math500 run-intervention \
 `--judge openai --judge-model gpt-5`
 替换成
 `--judge minimax --judge-model MiniMax-M2.5`
-即可。中国区如果需要，也可以先设置 `MINIMAX_BASE_URL=https://api.minimaxi.com/v1`。
+即可。中国区如果需要，也可以先设置 `MINIMAX_BASE_URL=https://api.minimaxi.com/v1`。如果外部 judge 报瞬时 `5xx`，可以同样追加 `--judge-max-retries` 和 `--judge-timeout`。
 
 如果你要做 `backtracking`，只需要把:
 - `--behavior reflection`
