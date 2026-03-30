@@ -22,6 +22,7 @@ from agora_sae.data.reasoning_steps import (
     DelimiterStepSegmenter,
     ReasoningStep,
 )
+from agora_sae.judge_json import parse_and_repair_label_payload
 from agora_sae.judge_transport import post_json_with_retry
 from agora_sae.jsonl_resume import load_jsonl_records, prepare_jsonl_output
 
@@ -34,9 +35,6 @@ FINAL_ANSWER_PATTERN = re.compile(
     r"(?:Final Answer|Answer)\s*[:：]\s*(.+)",
     re.IGNORECASE | re.DOTALL,
 )
-JSON_BLOCK_PATTERN = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-
-
 @dataclass
 class ReasoningSample:
     """Structured reasoning sample used by the paper-style evaluation pipeline."""
@@ -148,11 +146,14 @@ class OpenAIJudge(StepJudge):
         next_step: Optional[str] = None,
     ) -> Tuple[str, Optional[str]]:
         system_prompt = (
-            "You are labeling a reasoning step from a math solution. "
+            "You are a strict JSON labeling service for math reasoning steps. "
             "Use exactly one label: reflection, backtracking, or other. "
             "Reflection means re-checking or re-examining earlier reasoning. "
             "Backtracking means abandoning the current line of reasoning and switching to a new one. "
-            "Other means the step is neither reflection nor backtracking."
+            "Other means the step is neither reflection nor backtracking. "
+            "Do not output analysis, chain-of-thought, markdown, or code fences. "
+            "Return exactly one minified JSON object on one line with keys label and rationale. "
+            "Keep rationale under 16 words."
         )
         user_prompt = (
             f"Question:\n{question}\n\n"
@@ -160,7 +161,8 @@ class OpenAIJudge(StepJudge):
             f"Previous step:\n{previous_step or '<none>'}\n\n"
             f"Current step:\n{step_text}\n\n"
             f"Next step:\n{next_step or '<none>'}\n\n"
-            "Return JSON with keys label and rationale."
+            "Even if the current step is incomplete or truncated, still choose the best label from the available context. "
+            'Return exactly this schema and nothing else: {"label":"other","rationale":"short reason"}.'
         )
         schema = {
             "type": "object",
@@ -225,11 +227,7 @@ class OpenAIJudge(StepJudge):
         if not raw_text:
             raise ValueError("OpenAI response did not contain output text.")
 
-        parsed = json.loads(raw_text)
-        label = parsed.get("label")
-        if label not in {"reflection", "backtracking", "other"}:
-            raise ValueError(f"Unexpected label from judge: {label}")
-        return parsed
+        return parse_and_repair_label_payload(raw_text)
 
 
 class MinimaxJudge(StepJudge):
@@ -267,12 +265,14 @@ class MinimaxJudge(StepJudge):
         next_step: Optional[str] = None,
     ) -> Tuple[str, Optional[str]]:
         system_prompt = (
-            "You are labeling a reasoning step from a math solution. "
+            "You are a strict JSON labeling service for math reasoning steps. "
             "Use exactly one label: reflection, backtracking, or other. "
             "Reflection means re-checking or re-examining earlier reasoning. "
             "Backtracking means abandoning the current line of reasoning and switching to a new one. "
             "Other means the step is neither reflection nor backtracking. "
-            "Return only valid JSON with keys label and rationale."
+            "Do not output analysis, chain-of-thought, markdown, or code fences. "
+            "Return exactly one minified JSON object on one line with keys label and rationale. "
+            "Keep rationale under 16 words."
         )
         user_prompt = (
             f"Question:\n{question}\n\n"
@@ -280,7 +280,8 @@ class MinimaxJudge(StepJudge):
             f"Previous step:\n{previous_step or '<none>'}\n\n"
             f"Current step:\n{step_text}\n\n"
             f"Next step:\n{next_step or '<none>'}\n\n"
-            "Return JSON with keys label and rationale."
+            "Even if the current step is incomplete or truncated, still choose the best label from the available context. "
+            'Return exactly this schema and nothing else: {"label":"other","rationale":"short reason"}.'
         )
         payload = {
             "model": self.model,
@@ -323,7 +324,7 @@ class MinimaxJudge(StepJudge):
         if not raw_text:
             raise ValueError("MiniMax response did not contain message content.")
 
-        return cls._parse_label_payload(raw_text)
+        return parse_and_repair_label_payload(raw_text)
 
     @staticmethod
     def _extract_message_text(content) -> Optional[str]:
@@ -340,35 +341,6 @@ class MinimaxJudge(StepJudge):
                         parts.append(text.strip())
             return "\n".join(parts).strip() or None
         return None
-
-    @staticmethod
-    def _parse_label_payload(raw_text: str) -> Dict[str, str]:
-        candidates = [raw_text.strip()]
-
-        fenced_match = JSON_BLOCK_PATTERN.search(raw_text)
-        if fenced_match:
-            candidates.append(fenced_match.group(1).strip())
-
-        start_index = raw_text.find("{")
-        end_index = raw_text.rfind("}")
-        if start_index != -1 and end_index != -1 and end_index > start_index:
-            candidates.append(raw_text[start_index : end_index + 1].strip())
-
-        for candidate in candidates:
-            try:
-                parsed = json.loads(candidate)
-            except json.JSONDecodeError:
-                continue
-            label = parsed.get("label")
-            if label not in {"reflection", "backtracking", "other"}:
-                continue
-            rationale = parsed.get("rationale")
-            if rationale is not None:
-                rationale = str(rationale)
-            return {"label": label, "rationale": rationale}
-
-        raise ValueError(f"Could not parse MiniMax judge response as label JSON: {raw_text}")
-
 
 def get_step_judge(
     judge: str,
